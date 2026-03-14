@@ -6,8 +6,10 @@ pub mod swqos;
 pub mod trading;
 pub mod utils;
 use crate::common::nonce_cache::DurableNonceInfo;
+use crate::common::sdk_log;
 use crate::common::GasFeeStrategy;
-use crate::common::TradeConfig;
+use crate::common::{TradeConfig, InfrastructureConfig};
+#[cfg(feature = "perf-trace")]
 use crate::constants::trade::trade::DEFAULT_SLIPPAGE;
 use crate::constants::SOL_TOKEN_ACCOUNT;
 use crate::constants::USD1_TOKEN_ACCOUNT;
@@ -17,13 +19,15 @@ use crate::swqos::common::TradeError;
 use crate::swqos::SwqosClient;
 use crate::swqos::SwqosConfig;
 use crate::swqos::TradeType;
+// Re-export for SWQOS HTTP/QUIC choice in SwqosConfig (e.g. Astralane)
+pub use crate::swqos::SwqosTransport;
 use crate::trading::core::params::BonkParams;
 use crate::trading::core::params::MeteoraDammV2Params;
 use crate::trading::core::params::PumpFunParams;
 use crate::trading::core::params::PumpSwapParams;
 use crate::trading::core::params::RaydiumAmmV4Params;
 use crate::trading::core::params::RaydiumCpmmParams;
-use crate::trading::core::traits::ProtocolParams;
+use crate::trading::core::params::DexParamEnum;
 use crate::trading::factory::DexType;
 use crate::trading::MiddlewareManager;
 use crate::trading::SwapParams;
@@ -36,6 +40,40 @@ use solana_sdk::message::AddressLookupTableAccount;
 use solana_sdk::signer::Signer;
 use solana_sdk::{pubkey::Pubkey, signature::Keypair, signature::Signature};
 use std::sync::Arc;
+#[allow(unused_imports)]
+use tracing::{debug, error, info, warn};
+
+/// Single place to validate that protocol params match the given DEX type (avoids duplicate match in buy/sell).
+#[inline(always)]
+fn validate_protocol_params(dex_type: DexType, params: &DexParamEnum) -> bool {
+    match dex_type {
+        DexType::PumpFun => params.as_any().downcast_ref::<PumpFunParams>().is_some(),
+        DexType::PumpSwap => params.as_any().downcast_ref::<PumpSwapParams>().is_some(),
+        DexType::Bonk => params.as_any().downcast_ref::<BonkParams>().is_some(),
+        DexType::RaydiumCpmm => params.as_any().downcast_ref::<RaydiumCpmmParams>().is_some(),
+        DexType::RaydiumAmmV4 => params.as_any().downcast_ref::<RaydiumAmmV4Params>().is_some(),
+        DexType::MeteoraDammV2 => params.as_any().downcast_ref::<MeteoraDammV2Params>().is_some(),
+    }
+}
+
+/// 按 mint 查找池地址（通用入口，根据 DEX 类型分发，仅 PumpSwap 等已实现的类型会走优化路径）。
+///
+/// * `dex_type`：PumpSwap 时先走 PDA 再回退 getProgramAccounts，其他类型返回未实现错误。
+pub async fn find_pool_by_mint(
+    rpc: &SolanaRpcClient,
+    mint: &Pubkey,
+    dex_type: DexType,
+) -> Result<Pubkey, anyhow::Error> {
+    match dex_type {
+        DexType::PumpSwap => {
+            crate::instruction::utils::pumpswap::find_pool(rpc, mint).await
+        }
+        _ => Err(anyhow::anyhow!(
+            "find_pool_by_mint not implemented for {:?}",
+            dex_type
+        )),
+    }
+}
 
 /// Type of the token to buy
 #[derive(Clone, PartialEq)]
@@ -46,35 +84,149 @@ pub enum TradeTokenType {
     USDC,
 }
 
+/// Shared infrastructure components that can be reused across multiple wallets
+///
+/// This struct holds the expensive-to-initialize components (RPC client, SWQOS clients)
+/// that are wallet-independent and can be shared when only the trading wallet changes.
+pub struct TradingInfrastructure {
+    /// Shared RPC client for blockchain interactions
+    pub rpc: Arc<SolanaRpcClient>,
+    /// Shared SWQOS clients for transaction priority and routing
+    pub swqos_clients: Vec<Arc<SwqosClient>>,
+    /// Configuration used to create this infrastructure
+    pub config: InfrastructureConfig,
+}
+
+impl TradingInfrastructure {
+    /// Create new shared infrastructure from configuration
+    ///
+    /// This performs the expensive initialization:
+    /// - Creates RPC client with connection pool
+    /// - Creates SWQOS clients (each with their own HTTP client)
+    /// - Initializes rent cache and starts background updater
+    pub async fn new(config: InfrastructureConfig) -> Self {
+        // Install crypto provider (idempotent)
+        if CryptoProvider::get_default().is_none() {
+            let _ = default_provider()
+                .install_default()
+                .map_err(|e| anyhow::anyhow!("Failed to install crypto provider: {:?}", e));
+        }
+
+        // Create RPC client
+        let rpc = Arc::new(SolanaRpcClient::new_with_commitment(
+            config.rpc_url.clone(),
+            config.commitment.clone(),
+        ));
+
+        // Initialize rent cache (with timeout so slow RPC doesn't block forever)
+        const RENT_UPDATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+        match tokio::time::timeout(RENT_UPDATE_TIMEOUT, common::seed::update_rents(&rpc)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                if sdk_log::sdk_log_enabled() {
+                    warn!(target: "sol_trade_sdk", "rent update failed: {}, using defaults", e);
+                }
+                common::seed::set_default_rents();
+            }
+            Err(_) => {
+                if sdk_log::sdk_log_enabled() {
+                    warn!(target: "sol_trade_sdk", "rent update timed out ({}s), using defaults; check RPC", RENT_UPDATE_TIMEOUT.as_secs());
+                }
+                common::seed::set_default_rents();
+            }
+        }
+        common::seed::start_rent_updater(rpc.clone());
+
+        // Create SWQOS clients with blacklist checking（单节点超时 5s，避免某一家卡死整段初始化）
+        const SWQOS_CLIENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        let mut swqos_clients: Vec<Arc<SwqosClient>> = vec![];
+        for swqos in &config.swqos_configs {
+            if swqos.is_blacklisted() {
+                if sdk_log::sdk_log_enabled() {
+                    warn!(target: "sol_trade_sdk", "⚠️ SWQOS {:?} is blacklisted, skipping", swqos.swqos_type());
+                }
+                continue;
+            }
+            match tokio::time::timeout(
+                SWQOS_CLIENT_TIMEOUT,
+                SwqosConfig::get_swqos_client(
+                    config.rpc_url.clone(),
+                    config.commitment.clone(),
+                    swqos.clone(),
+                ),
+            )
+            .await
+            {
+                Ok(Ok(swqos_client)) => swqos_clients.push(swqos_client),
+                Ok(Err(err)) => {
+                    if sdk_log::sdk_log_enabled() {
+                        warn!(
+                            target: "sol_trade_sdk",
+                            "failed to create {:?} swqos client: {err}. Excluding from swqos list",
+                            swqos.swqos_type()
+                        );
+                    }
+                }
+                Err(_) => {
+                    if sdk_log::sdk_log_enabled() {
+                        warn!(
+                            target: "sol_trade_sdk",
+                            "swqos {:?} init timed out ({}s), skipping",
+                            swqos.swqos_type(),
+                            SWQOS_CLIENT_TIMEOUT.as_secs()
+                        );
+                    }
+                }
+            }
+        }
+
+        Self {
+            rpc,
+            swqos_clients,
+            config,
+        }
+    }
+}
+
 /// Main trading client for Solana DeFi protocols
 ///
-/// `SolanaTrade` provides a unified interface for trading across multiple Solana DEXs
+/// `SolTradingSDK` provides a unified interface for trading across multiple Solana DEXs
 /// including PumpFun, PumpSwap, Bonk, Raydium AMM V4, and Raydium CPMM.
 /// It manages RPC connections, transaction signing, and SWQOS (Solana Web Quality of Service) settings.
-pub struct SolanaTrade {
+pub struct TradingClient {
     /// The keypair used for signing all transactions
     pub payer: Arc<Keypair>,
-    /// RPC client for blockchain interactions
-    pub rpc: Arc<SolanaRpcClient>,
-    /// SWQOS clients for transaction priority and routing
-    pub swqos_clients: Vec<Arc<SwqosClient>>,
+    /// Shared infrastructure (RPC client, SWQOS clients)
+    /// Can be shared across multiple TradingClient instances with different wallets
+    pub infrastructure: Arc<TradingInfrastructure>,
     /// Optional middleware manager for custom transaction processing
     pub middleware_manager: Option<Arc<MiddlewareManager>>,
     /// Whether to use seed optimization for all ATA operations (default: true)
     /// Applies to all token account creations across buy and sell operations
     pub use_seed_optimize: bool,
+    /// Whether to pin parallel submit tasks to CPU cores (from TradeConfig.use_core_affinity). Default true.
+    pub use_core_affinity: bool,
+    /// Whether to output all SDK logs (from TradeConfig.log_enabled).
+    pub log_enabled: bool,
+    /// Whether to check minimum tip per SWQOS (from TradeConfig.check_min_tip). Default false for lower latency.
+    pub check_min_tip: bool,
 }
 
-static INSTANCE: Mutex<Option<Arc<SolanaTrade>>> = Mutex::new(None);
+static INSTANCE: Mutex<Option<Arc<TradingClient>>> = Mutex::new(None);
 
-impl Clone for SolanaTrade {
+/// 🔄 向后兼容：SolanaTrade 别名
+pub type SolanaTrade = TradingClient;
+
+impl Clone for TradingClient {
     fn clone(&self) -> Self {
         Self {
             payer: self.payer.clone(),
-            rpc: self.rpc.clone(),
-            swqos_clients: self.swqos_clients.clone(),
+            infrastructure: self.infrastructure.clone(),
             middleware_manager: self.middleware_manager.clone(),
             use_seed_optimize: self.use_seed_optimize,
+            use_core_affinity: self.use_core_affinity,
+            log_enabled: self.log_enabled,
+            check_min_tip: self.check_min_tip,
         }
     }
 }
@@ -99,7 +251,7 @@ pub struct TradeBuyParams {
     /// Recent blockhash for transaction validity
     pub recent_blockhash: Option<Hash>,
     /// Protocol-specific parameters (PumpFun, Raydium, etc.)
-    pub extension_params: Box<dyn ProtocolParams>,
+    pub extension_params: DexParamEnum,
     // Extended configuration
     /// Optional address lookup table for transaction size optimization
     pub address_lookup_table_account: Option<AddressLookupTableAccount>,
@@ -119,6 +271,13 @@ pub struct TradeBuyParams {
     pub gas_fee_strategy: GasFeeStrategy,
     /// Whether to simulate the transaction instead of executing it
     pub simulate: bool,
+    /// Use exact SOL amount instructions (buy_exact_sol_in for PumpFun, buy_exact_quote_in for PumpSwap).
+    /// When Some(true) or None (default), the exact SOL/quote amount is spent and slippage is applied to output tokens.
+    /// When Some(false), uses regular buy instruction where slippage is applied to SOL/quote input.
+    /// This option only applies to PumpFun and PumpSwap DEXes; it is ignored for other DEXes.
+    pub use_exact_sol_amount: Option<bool>,
+    /// 可选：事件收到时间（微秒，与 sol-parser-sdk 的 metadata.grpc_recv_us / clock::now_micros 同源）。不传且开启 log_enabled 时 SDK 用 now_micros() 作为起点，打印起点→提交耗时。
+    pub grpc_recv_us: Option<i64>,
 }
 
 /// Parameters for executing sell orders across different DEX protocols
@@ -143,7 +302,7 @@ pub struct TradeSellParams {
     /// Whether to include tip for transaction priority
     pub with_tip: bool,
     /// Protocol-specific parameters (PumpFun, Raydium, etc.)
-    pub extension_params: Box<dyn ProtocolParams>,
+    pub extension_params: DexParamEnum,
     // Extended configuration
     /// Optional address lookup table for transaction size optimization
     pub address_lookup_table_account: Option<AddressLookupTableAccount>,
@@ -163,118 +322,246 @@ pub struct TradeSellParams {
     pub gas_fee_strategy: GasFeeStrategy,
     /// Whether to simulate the transaction instead of executing it
     pub simulate: bool,
+    /// 可选：事件收到时间（微秒，与 sol-parser-sdk clock 同源）。不传且开启 log_enabled 时 SDK 用 now_micros() 作为起点。
+    pub grpc_recv_us: Option<i64>,
 }
 
-impl SolanaTrade {
-    /// Creates a new SolanaTrade instance with the specified configuration
+impl TradingClient {
+    /// Create a TradingClient from shared infrastructure (fast path)
+    ///
+    /// This is the preferred method when multiple wallets share the same infrastructure.
+    /// It only performs wallet-specific initialization (fast_init) without the expensive
+    /// RPC/SWQOS client creation.
+    ///
+    /// # Arguments
+    /// * `payer` - The keypair used for signing transactions
+    /// * `infrastructure` - Shared infrastructure (RPC client, SWQOS clients)
+    /// * `use_seed_optimize` - Whether to use seed optimization for ATA operations
+    ///
+    /// # Returns
+    /// Returns a configured `TradingClient` instance ready for trading operations
+    pub fn from_infrastructure(
+        payer: Arc<Keypair>,
+        infrastructure: Arc<TradingInfrastructure>,
+        use_seed_optimize: bool,
+    ) -> Self {
+        // Initialize wallet-specific caches (fast, synchronous)
+        crate::common::fast_fn::fast_init(&payer.pubkey());
+
+        Self {
+            payer,
+            infrastructure,
+            middleware_manager: None,
+            use_seed_optimize,
+            use_core_affinity: true,
+            log_enabled: true,
+            check_min_tip: false,
+        }
+    }
+
+    /// Create a TradingClient from shared infrastructure with optional WSOL ATA setup
+    ///
+    /// Same as `from_infrastructure` but also handles WSOL ATA creation if requested.
+    ///
+    /// # Arguments
+    /// * `payer` - The keypair used for signing transactions
+    /// * `infrastructure` - Shared infrastructure (RPC client, SWQOS clients)
+    /// * `use_seed_optimize` - Whether to use seed optimization for ATA operations
+    /// * `create_wsol_ata` - Whether to check/create WSOL ATA
+    pub async fn from_infrastructure_with_wsol_setup(
+        payer: Arc<Keypair>,
+        infrastructure: Arc<TradingInfrastructure>,
+        use_seed_optimize: bool,
+        create_wsol_ata: bool,
+    ) -> Self {
+        crate::common::fast_fn::fast_init(&payer.pubkey());
+
+        if create_wsol_ata {
+            // 在后台异步创建 WSOL ATA，不阻塞启动
+            let payer_clone = payer.clone();
+            let rpc_clone = infrastructure.rpc.clone();
+            tokio::spawn(async move {
+                Self::ensure_wsol_ata(&payer_clone, &rpc_clone).await;
+            });
+            if sdk_log::sdk_log_enabled() {
+                info!(target: "sol_trade_sdk", "ℹ️ WSOL ATA creation started in background, does not block bot startup");
+            }
+        }
+
+        Self {
+            payer,
+            infrastructure,
+            middleware_manager: None,
+            use_seed_optimize,
+            use_core_affinity: true,
+            log_enabled: true,
+            check_min_tip: false,
+        }
+    }
+
+    /// 单次尝试创建 WSOL ATA：获取 blockhash、组交易、发送并确认。成功或账户已存在返回 Ok(())，否则返回 Err(错误信息)。
+    async fn try_create_wsol_ata_once(
+        rpc: &SolanaRpcClient,
+        payer: &Arc<Keypair>,
+        wsol_ata: &solana_sdk::pubkey::Pubkey,
+        create_ata_ixs: &[solana_sdk::instruction::Instruction],
+        timeout_secs: u64,
+    ) -> Result<(), String> {
+        use solana_sdk::transaction::Transaction;
+        let recent_blockhash = rpc.get_latest_blockhash().await
+            .map_err(|e| format!("Failed to get blockhash: {}", e))?;
+        let tx = Transaction::new_signed_with_payer(
+            create_ata_ixs,
+            Some(&payer.pubkey()),
+            &[payer.as_ref()],
+            recent_blockhash,
+        );
+        let send_result = tokio::time::timeout(
+            tokio::time::Duration::from_secs(timeout_secs),
+            rpc.send_and_confirm_transaction(&tx),
+        ).await;
+        match send_result {
+            Ok(Ok(_signature)) => Ok(()),
+            Ok(Err(e)) => {
+                if rpc.get_account(wsol_ata).await.is_ok() {
+                    return Ok(());
+                }
+                Err(format!("{}", e))
+            }
+            Err(_) => Err(format!("Transaction confirmation timeout ({}s)", timeout_secs)),
+        }
+    }
+
+    /// 确保钱包存在 WSOL ATA；不存在则发交易创建（会花费租金 + 手续费，初始化阶段唯一会扣钱的逻辑）
+    async fn ensure_wsol_ata(payer: &Arc<Keypair>, rpc: &Arc<SolanaRpcClient>) {
+        const MAX_RETRIES: usize = 3;
+        const TIMEOUT_SECS: u64 = 10;
+
+        let wsol_ata =
+            crate::common::fast_fn::get_associated_token_address_with_program_id_fast(
+                &payer.pubkey(),
+                &WSOL_TOKEN_ACCOUNT,
+                &crate::constants::TOKEN_PROGRAM,
+            );
+
+        if rpc.get_account(&wsol_ata).await.is_ok() {
+            if sdk_log::sdk_log_enabled() {
+                info!(target: "sol_trade_sdk", "✅ WSOL ATA already exists: {}", wsol_ata);
+            }
+            return;
+        }
+
+        let create_ata_ixs =
+            crate::trading::common::wsol_manager::create_wsol_ata(&payer.pubkey());
+        if create_ata_ixs.is_empty() {
+            if sdk_log::sdk_log_enabled() {
+                info!(target: "sol_trade_sdk", "ℹ️ WSOL ATA already exists (no need to create)");
+            }
+            return;
+        }
+
+        if sdk_log::sdk_log_enabled() {
+            info!(target: "sol_trade_sdk", "🔨 Creating WSOL ATA: {}", wsol_ata);
+        }
+        let mut last_error = None;
+        for attempt in 1..=MAX_RETRIES {
+            if attempt > 1 {
+                if sdk_log::sdk_log_enabled() {
+                    info!(target: "sol_trade_sdk", "🔄 Retrying WSOL ATA creation (attempt {}/{})...", attempt, MAX_RETRIES);
+                }
+                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            }
+            match Self::try_create_wsol_ata_once(rpc.as_ref(), payer, &wsol_ata, &create_ata_ixs, TIMEOUT_SECS).await {
+                Ok(()) => {
+                    if sdk_log::sdk_log_enabled() {
+                        info!(target: "sol_trade_sdk", "✅ WSOL ATA created or already exists");
+                    }
+                    return;
+                }
+                Err(e) => {
+                    last_error = Some(e.clone());
+                    if attempt < MAX_RETRIES && sdk_log::sdk_log_enabled() {
+                        warn!(target: "sol_trade_sdk", "⚠️ Attempt {} failed: {}", attempt, e);
+                    }
+                }
+            }
+        }
+
+        if let Some(err) = last_error {
+            if sdk_log::sdk_log_enabled() {
+                error!(target: "sol_trade_sdk", "❌ WSOL ATA creation failed after {} retries: {}", MAX_RETRIES, wsol_ata);
+                error!(target: "sol_trade_sdk", "   Error: {}", err);
+                error!(target: "sol_trade_sdk", "   💡 Possible causes: insufficient SOL, RPC timeout, or fee");
+                error!(target: "sol_trade_sdk", "   🔧 Solutions: fund wallet (e.g. 0.1 SOL), retry, check RPC");
+            }
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            panic!(
+                "❌ WSOL ATA creation failed and account does not exist: {}. Error: {}",
+                wsol_ata, err
+            );
+        }
+    }
+
+    /// Creates a new SolTradingSDK instance with the specified configuration
     ///
     /// This function initializes the trading system with RPC connection, SWQOS settings,
     /// and sets up necessary components for trading operations.
     ///
     /// # Arguments
     /// * `payer` - The keypair used for signing transactions
-    /// * `rpc_url` - Solana RPC endpoint URL
-    /// * `commitment` - Transaction commitment level for RPC calls
-    /// * `swqos_settings` - List of SWQOS (Solana Web Quality of Service) configurations
+    /// * `trade_config` - Trading configuration including RPC URL, SWQOS settings, etc.
     ///
     /// # Returns
-    /// Returns a configured `SolanaTrade` instance ready for trading operations
+    /// Returns a configured `SolTradingSDK` instance ready for trading operations
     #[inline]
     pub async fn new(payer: Arc<Keypair>, trade_config: TradeConfig) -> Self {
-        crate::common::fast_fn::fast_init(&payer.try_pubkey().unwrap());
+        // 设置 SDK 全局日志开关，后续所有 SDK 内日志（SWQOS/WSOL/耗时等）均受此控制
+        sdk_log::set_sdk_log_enabled(trade_config.log_enabled);
+        // 预热高性能时钟，避免首笔交易时触发 3 次 Utc::now() 校准
+        let _ = crate::common::clock::now_micros();
+        // Create infrastructure from trade config
+        let infra_config = InfrastructureConfig::from_trade_config(&trade_config);
+        let infrastructure = Arc::new(TradingInfrastructure::new(infra_config).await);
 
-        if CryptoProvider::get_default().is_none() {
-            let _ = default_provider()
-                .install_default()
-                .map_err(|e| anyhow::anyhow!("Failed to install crypto provider: {:?}", e));
-        }
+        // Initialize wallet-specific caches
+        crate::common::fast_fn::fast_init(&payer.pubkey());
 
-        let rpc_url = trade_config.rpc_url.clone();
-        let swqos_configs = trade_config.swqos_configs.clone();
-        let commitment = trade_config.commitment.clone();
-        let mut swqos_clients: Vec<Arc<SwqosClient>> = vec![];
-
-        for swqos in swqos_configs {
-            let swqos_client =
-                SwqosConfig::get_swqos_client(rpc_url.clone(), commitment.clone(), swqos.clone());
-            swqos_clients.push(swqos_client);
-        }
-
-        let rpc =
-            Arc::new(SolanaRpcClient::new_with_commitment(rpc_url.clone(), commitment.clone()));
-        common::seed::update_rents(&rpc).await.unwrap();
-        common::seed::start_rent_updater(rpc.clone());
-
-        // 🔧 初始化WSOL ATA：如果配置为启动时创建，则检查并创建
+        // ═══════════════════════════════════════════════════════════════════════════════
+        // 初始化阶段会花费租金/手续费的唯一路径：创建 WSOL ATA（ensure_wsol_ata）
+        // - 触发条件：create_wsol_ata_on_startup == true 且钱包 SOL >= MIN_SOL_FOR_WSOL_ATA_LAMPORTS
+        // - 花费：ATA 租金（约 0.00203928 SOL）+ 交易手续费；钱包不足时已跳过
+        // - 其它初始化（TradingInfrastructure::new、update_rents、get_swqos_client）仅 RPC/HTTP，不发送交易
+        // ═══════════════════════════════════════════════════════════════════════════════
         if trade_config.create_wsol_ata_on_startup {
-            // 根据seed配置计算WSOL ATA地址
-            let wsol_ata =
-                crate::common::fast_fn::get_associated_token_address_with_program_id_fast(
-                    &payer.pubkey(),
-                    &WSOL_TOKEN_ACCOUNT,
-                    &crate::constants::TOKEN_PROGRAM,
+            const MIN_SOL_FOR_WSOL_ATA_LAMPORTS: u64 = 500_000; // 约 0.0005 SOL，用于 ATA 租金 + 手续费
+            const BALANCE_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+            let balance = tokio::time::timeout(
+                BALANCE_CHECK_TIMEOUT,
+                infrastructure.rpc.get_balance(&payer.pubkey()),
+            )
+            .await
+            .unwrap_or(Ok(0))
+            .unwrap_or(0);
+            if balance >= MIN_SOL_FOR_WSOL_ATA_LAMPORTS {
+                Self::ensure_wsol_ata(&payer, &infrastructure.rpc).await;
+            } else if sdk_log::sdk_log_enabled() {
+                info!(
+                    target: "sol_trade_sdk",
+                    "⏭️ 跳过创建 WSOL ATA：钱包 SOL 不足（当前 {} lamports，需要至少 {}）",
+                    balance,
+                    MIN_SOL_FOR_WSOL_ATA_LAMPORTS
                 );
-
-            // 查询账户是否存在
-            match rpc.get_account(&wsol_ata).await {
-                Ok(_) => {
-                    // WSOL ATA已存在
-                    println!("✅ WSOL ATA已存在: {}", wsol_ata);
-                }
-                Err(_) => {
-                    // WSOL ATA不存在，创建它
-                    println!("🔨 创建WSOL ATA: {}", wsol_ata);
-                    // 使用seed优化创建WSOL ATA
-                    let create_ata_ixs =
-                        crate::trading::common::wsol_manager::create_wsol_ata(&payer.pubkey());
-
-                    if !create_ata_ixs.is_empty() {
-                        // 构建并发送交易
-                        use solana_sdk::transaction::Transaction;
-                        let recent_blockhash = rpc.get_latest_blockhash().await.unwrap();
-                        let tx = Transaction::new_signed_with_payer(
-                            &create_ata_ixs,
-                            Some(&payer.pubkey()),
-                            &[payer.as_ref()],
-                            recent_blockhash,
-                        );
-
-                        match rpc.send_and_confirm_transaction(&tx).await {
-                            Ok(signature) => {
-                                println!("✅ WSOL ATA创建成功: {}", signature);
-                            }
-                            Err(e) => {
-                                // 创建失败，检查是否是因为已存在
-                                match rpc.get_account(&wsol_ata).await {
-                                    Ok(_) => {
-                                        println!(
-                                            "✅ WSOL ATA已存在（交易失败但账户存在）: {}",
-                                            wsol_ata
-                                        );
-                                    }
-                                    Err(_) => {
-                                        // 账户不存在且创建失败 - 这是严重错误，应该让启动失败
-                                        panic!(
-                                            "❌ WSOL ATA创建失败且账户不存在: {}. 错误: {}",
-                                            wsol_ata, e
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        println!("ℹ️ WSOL ATA已存在（无需创建）");
-                    }
-                }
             }
         }
 
         let instance = Self {
             payer,
-            rpc,
-            swqos_clients,
+            infrastructure,
             middleware_manager: None,
             use_seed_optimize: trade_config.use_seed_optimize,
+            use_core_affinity: trade_config.use_core_affinity,
+            log_enabled: trade_config.log_enabled,
+            check_min_tip: trade_config.check_min_tip,
         };
 
         let mut current = INSTANCE.lock();
@@ -306,7 +593,7 @@ impl SolanaTrade {
     /// # Returns
     /// Returns a reference to the Arc-wrapped SolanaRpcClient instance
     pub fn get_rpc(&self) -> &Arc<SolanaRpcClient> {
-        &self.rpc
+        &self.infrastructure.rpc
     }
 
     /// Gets the current globally shared SolanaTrade instance
@@ -329,13 +616,18 @@ impl SolanaTrade {
 
     /// Execute a buy order for a specified token
     ///
+    /// 🔧 修复：返回Vec<Signature>支持多SWQOS并发交易
+    /// - bool: 是否至少有一个交易成功
+    /// - Vec<Signature>: 所有提交的交易签名（按SWQOS顺序）
+    /// - Option<TradeError>: 最后一个错误（如果全部失败）
+    ///
     /// # Arguments
     ///
     /// * `params` - Buy trade parameters containing all necessary trading configuration
     ///
     /// # Returns
     ///
-    /// Returns `Ok(Signature)` with the transaction signature if the buy order is successfully executed,
+    /// Returns `Ok((bool, Vec<Signature>, Option<TradeError>))` with success flag and all transaction signatures,
     /// or an error if the transaction fails.
     ///
     /// # Errors
@@ -346,19 +638,34 @@ impl SolanaTrade {
     /// - Network or RPC errors occur
     /// - Insufficient SOL balance for the purchase
     /// - Required accounts cannot be created or accessed
+    #[inline]
     pub async fn buy(
         &self,
         params: TradeBuyParams,
-    ) -> Result<(bool, Signature, Option<TradeError>), anyhow::Error> {
-        if params.slippage_basis_points.is_none() {
-            println!(
+    ) -> Result<(bool, Vec<Signature>, Option<TradeError>), anyhow::Error> {
+        if params.recent_blockhash.is_none() && params.durable_nonce.is_none() {
+            return Err(anyhow::anyhow!(
+                "Must provide either recent_blockhash or durable_nonce for buy (required for transaction validity)"
+            ));
+        }
+        #[cfg(feature = "perf-trace")]
+        if sdk_log::sdk_log_enabled() && params.slippage_basis_points.is_none() {
+            debug!(
+                target: "sol_trade_sdk",
                 "slippage_basis_points is none, use default slippage basis points: {}",
                 DEFAULT_SLIPPAGE
             );
         }
         if params.input_token_type == TradeTokenType::USD1 && params.dex_type != DexType::Bonk {
             return Err(anyhow::anyhow!(
-                " Current version only support USD1 trading on Bonk protocols"
+                " Current version only supports USD1 trading on Bonk protocols"
+            ));
+        }
+        let protocol_params = params.extension_params;
+        if !validate_protocol_params(params.dex_type, &protocol_params) {
+            return Err(anyhow::anyhow!(
+                "Invalid protocol params for Trade (dex={:?})",
+                params.dex_type
             ));
         }
         let input_token_mint = if params.input_token_type == TradeTokenType::SOL {
@@ -370,10 +677,9 @@ impl SolanaTrade {
         } else {
             USD1_TOKEN_ACCOUNT
         };
-        let executor = TradeFactory::create_executor(params.dex_type.clone());
-        let protocol_params = params.extension_params;
+        let executor = TradeFactory::create_executor(params.dex_type);
         let buy_params = SwapParams {
-            rpc: Some(self.rpc.clone()),
+            rpc: Some(self.infrastructure.rpc.clone()),
             payer: self.payer.clone(),
             trade_type: TradeType::Buy,
             input_mint: input_token_mint,
@@ -384,16 +690,10 @@ impl SolanaTrade {
             slippage_basis_points: params.slippage_basis_points,
             address_lookup_table_account: params.address_lookup_table_account,
             recent_blockhash: params.recent_blockhash,
-            data_size_limit: params
-                .gas_fee_strategy
-                .get_strategies(TradeType::Buy)
-                .get(0)
-                .map(|(_, _, v)| v.data_size_limit)
-                .unwrap_or(256 * 1024),
             wait_transaction_confirmed: params.wait_transaction_confirmed,
-            protocol_params: protocol_params.clone(),
+            protocol_params,
             open_seed_optimize: self.use_seed_optimize, // 使用全局seed优化配置
-            swqos_clients: self.swqos_clients.clone(),
+            swqos_clients: self.infrastructure.swqos_clients.clone(),
             middleware_manager: self.middleware_manager.clone(),
             durable_nonce: params.durable_nonce,
             with_tip: true,
@@ -404,37 +704,25 @@ impl SolanaTrade {
             fixed_output_amount: params.fixed_output_token_amount,
             gas_fee_strategy: params.gas_fee_strategy,
             simulate: params.simulate,
+            log_enabled: self.log_enabled,
+            use_core_affinity: self.use_core_affinity,
+            check_min_tip: self.check_min_tip,
+            grpc_recv_us: params.grpc_recv_us,
+            use_exact_sol_amount: params.use_exact_sol_amount,
         };
-
-        // Validate protocol params
-        let is_valid_params = match params.dex_type {
-            DexType::PumpFun => protocol_params.as_any().downcast_ref::<PumpFunParams>().is_some(),
-            DexType::PumpSwap => {
-                protocol_params.as_any().downcast_ref::<PumpSwapParams>().is_some()
-            }
-            DexType::Bonk => protocol_params.as_any().downcast_ref::<BonkParams>().is_some(),
-            DexType::RaydiumCpmm => {
-                protocol_params.as_any().downcast_ref::<RaydiumCpmmParams>().is_some()
-            }
-            DexType::RaydiumAmmV4 => {
-                protocol_params.as_any().downcast_ref::<RaydiumAmmV4Params>().is_some()
-            }
-            DexType::MeteoraDammV2 => {
-                protocol_params.as_any().downcast_ref::<MeteoraDammV2Params>().is_some()
-            }
-        };
-
-        if !is_valid_params {
-            return Err(anyhow::anyhow!("Invalid protocol params for Trade"));
-        }
 
         let swap_result = executor.swap(buy_params).await;
         let result =
-            swap_result.map(|(success, sig, err)| (success, sig, err.map(TradeError::from)));
+            swap_result.map(|(success, sigs, err)| (success, sigs, err.map(TradeError::from)));
         return result;
     }
 
     /// Execute a sell order for a specified token
+    ///
+    /// 🔧 修复：返回Vec<Signature>支持多SWQOS并发交易
+    /// - bool: 是否至少有一个交易成功
+    /// - Vec<Signature>: 所有提交的交易签名（按SWQOS顺序）
+    /// - Option<TradeError>: 最后一个错误（如果全部失败）
     ///
     /// # Arguments
     ///
@@ -442,7 +730,7 @@ impl SolanaTrade {
     ///
     /// # Returns
     ///
-    /// Returns `Ok(Signature)` with the transaction signature if the sell order is successfully executed,
+    /// Returns `Ok((bool, Vec<Signature>, Option<TradeError>))` with success flag and all transaction signatures,
     /// or an error if the transaction fails.
     ///
     /// # Errors
@@ -454,23 +742,37 @@ impl SolanaTrade {
     /// - Insufficient token balance for the sale
     /// - Token account doesn't exist or is not properly initialized
     /// - Required accounts cannot be created or accessed
+    #[inline]
     pub async fn sell(
         &self,
         params: TradeSellParams,
-    ) -> Result<(bool, Signature, Option<TradeError>), anyhow::Error> {
-        if params.slippage_basis_points.is_none() {
-            println!(
+    ) -> Result<(bool, Vec<Signature>, Option<TradeError>), anyhow::Error> {
+        #[cfg(feature = "perf-trace")]
+        if sdk_log::sdk_log_enabled() && params.slippage_basis_points.is_none() {
+            debug!(
+                target: "sol_trade_sdk",
                 "slippage_basis_points is none, use default slippage basis points: {}",
                 DEFAULT_SLIPPAGE
             );
         }
-        if params.output_token_type == TradeTokenType::USD1 && params.dex_type != DexType::Bonk {
+        if params.recent_blockhash.is_none() && params.durable_nonce.is_none() {
             return Err(anyhow::anyhow!(
-                " Current version only support USD1 trading on Bonk protocols"
+                "Must provide either recent_blockhash or durable_nonce for sell (required for transaction validity)"
             ));
         }
-        let executor = TradeFactory::create_executor(params.dex_type.clone());
+        if params.output_token_type == TradeTokenType::USD1 && params.dex_type != DexType::Bonk {
+            return Err(anyhow::anyhow!(
+                " Current version only supports USD1 trading on Bonk protocols"
+            ));
+        }
         let protocol_params = params.extension_params;
+        if !validate_protocol_params(params.dex_type, &protocol_params) {
+            return Err(anyhow::anyhow!(
+                "Invalid protocol params for Trade (dex={:?})",
+                params.dex_type
+            ));
+        }
+        let executor = TradeFactory::create_executor(params.dex_type);
         let output_token_mint = if params.output_token_type == TradeTokenType::SOL {
             SOL_TOKEN_ACCOUNT
         } else if params.output_token_type == TradeTokenType::WSOL {
@@ -481,7 +783,7 @@ impl SolanaTrade {
             USD1_TOKEN_ACCOUNT
         };
         let sell_params = SwapParams {
-            rpc: Some(self.rpc.clone()),
+            rpc: Some(self.infrastructure.rpc.clone()),
             payer: self.payer.clone(),
             trade_type: TradeType::Sell,
             input_mint: params.mint,
@@ -493,18 +795,12 @@ impl SolanaTrade {
             address_lookup_table_account: params.address_lookup_table_account,
             recent_blockhash: params.recent_blockhash,
             wait_transaction_confirmed: params.wait_transaction_confirmed,
-            protocol_params: protocol_params.clone(),
+            protocol_params,
             with_tip: params.with_tip,
             open_seed_optimize: self.use_seed_optimize, // 使用全局seed优化配置
-            swqos_clients: self.swqos_clients.clone(),
+            swqos_clients: self.infrastructure.swqos_clients.clone(),
             middleware_manager: self.middleware_manager.clone(),
             durable_nonce: params.durable_nonce,
-            data_size_limit: params
-                .gas_fee_strategy
-                .get_strategies(TradeType::Sell)
-                .get(0)
-                .map(|(_, _, v)| v.data_size_limit)
-                .unwrap_or(0),
             create_input_mint_ata: false,
             close_input_mint_ata: params.close_mint_token_ata,
             create_output_mint_ata: params.create_output_token_ata,
@@ -512,34 +808,16 @@ impl SolanaTrade {
             fixed_output_amount: params.fixed_output_token_amount,
             gas_fee_strategy: params.gas_fee_strategy,
             simulate: params.simulate,
+            log_enabled: self.log_enabled,
+            use_core_affinity: self.use_core_affinity,
+            check_min_tip: self.check_min_tip,
+            grpc_recv_us: params.grpc_recv_us,
+            use_exact_sol_amount: None,
         };
 
-        // Validate protocol params
-        let is_valid_params = match params.dex_type {
-            DexType::PumpFun => protocol_params.as_any().downcast_ref::<PumpFunParams>().is_some(),
-            DexType::PumpSwap => {
-                protocol_params.as_any().downcast_ref::<PumpSwapParams>().is_some()
-            }
-            DexType::Bonk => protocol_params.as_any().downcast_ref::<BonkParams>().is_some(),
-            DexType::RaydiumCpmm => {
-                protocol_params.as_any().downcast_ref::<RaydiumCpmmParams>().is_some()
-            }
-            DexType::RaydiumAmmV4 => {
-                protocol_params.as_any().downcast_ref::<RaydiumAmmV4Params>().is_some()
-            }
-            DexType::MeteoraDammV2 => {
-                protocol_params.as_any().downcast_ref::<MeteoraDammV2Params>().is_some()
-            }
-        };
-
-        if !is_valid_params {
-            return Err(anyhow::anyhow!("Invalid protocol params for Trade"));
-        }
-
-        // Execute sell based on tip preference
         let swap_result = executor.swap(sell_params).await;
         let result =
-            swap_result.map(|(success, sig, err)| (success, sig, err.map(TradeError::from)));
+            swap_result.map(|(success, sigs, err)| (success, sigs, err.map(TradeError::from)));
         return result;
     }
 
@@ -574,7 +852,7 @@ impl SolanaTrade {
         mut params: TradeSellParams,
         amount_token: u64,
         percent: u64,
-    ) -> Result<(bool, Signature, Option<TradeError>), anyhow::Error> {
+    ) -> Result<(bool, Vec<Signature>, Option<TradeError>), anyhow::Error> {
         if percent == 0 || percent > 100 {
             return Err(anyhow::anyhow!("Percentage must be between 1 and 100"));
         }
@@ -606,12 +884,12 @@ impl SolanaTrade {
     pub async fn wrap_sol_to_wsol(&self, amount: u64) -> Result<String, anyhow::Error> {
         use crate::trading::common::wsol_manager::handle_wsol;
         use solana_sdk::transaction::Transaction;
-        let recent_blockhash = self.rpc.get_latest_blockhash().await?;
+        let recent_blockhash = self.infrastructure.rpc.get_latest_blockhash().await?;
         let instructions = handle_wsol(&self.payer.pubkey(), amount);
         let mut transaction =
             Transaction::new_with_payer(&instructions, Some(&self.payer.pubkey()));
         transaction.sign(&[&*self.payer], recent_blockhash);
-        let signature = self.rpc.send_and_confirm_transaction(&transaction).await?;
+        let signature = self.infrastructure.rpc.send_and_confirm_transaction(&transaction).await?;
         Ok(signature.to_string())
     }
     /// Closes the wSOL associated token account and unwraps remaining balance to native SOL
@@ -634,12 +912,12 @@ impl SolanaTrade {
     pub async fn close_wsol(&self) -> Result<String, anyhow::Error> {
         use crate::trading::common::wsol_manager::close_wsol;
         use solana_sdk::transaction::Transaction;
-        let recent_blockhash = self.rpc.get_latest_blockhash().await?;
+        let recent_blockhash = self.infrastructure.rpc.get_latest_blockhash().await?;
         let instructions = close_wsol(&self.payer.pubkey());
         let mut transaction =
             Transaction::new_with_payer(&instructions, Some(&self.payer.pubkey()));
         transaction.sign(&[&*self.payer], recent_blockhash);
-        let signature = self.rpc.send_and_confirm_transaction(&transaction).await?;
+        let signature = self.infrastructure.rpc.send_and_confirm_transaction(&transaction).await?;
         Ok(signature.to_string())
     }
 
@@ -664,7 +942,7 @@ impl SolanaTrade {
         use crate::trading::common::wsol_manager::create_wsol_ata;
         use solana_sdk::transaction::Transaction;
 
-        let recent_blockhash = self.rpc.get_latest_blockhash().await?;
+        let recent_blockhash = self.infrastructure.rpc.get_latest_blockhash().await?;
         let instructions = create_wsol_ata(&self.payer.pubkey());
 
         // If instructions are empty, ATA already exists
@@ -675,7 +953,7 @@ impl SolanaTrade {
         let mut transaction =
             Transaction::new_with_payer(&instructions, Some(&self.payer.pubkey()));
         transaction.sign(&[&*self.payer], recent_blockhash);
-        let signature = self.rpc.send_and_confirm_transaction(&transaction).await?;
+        let signature = self.infrastructure.rpc.send_and_confirm_transaction(&transaction).await?;
         Ok(signature.to_string())
     }
 
@@ -714,7 +992,7 @@ impl SolanaTrade {
             &crate::constants::TOKEN_PROGRAM,
         )?;
 
-        let account_exists = self.rpc.get_account(&seed_ata_address).await.is_ok();
+        let account_exists = self.infrastructure.rpc.get_account(&seed_ata_address).await.is_ok();
 
         let instructions = if account_exists {
             // 如果账户已存在，使用不创建账户的版本
@@ -724,10 +1002,59 @@ impl SolanaTrade {
             wrap_wsol_to_sol_internal(&self.payer.pubkey(), amount)?
         };
 
-        let recent_blockhash = self.rpc.get_latest_blockhash().await?;
+        let recent_blockhash = self.infrastructure.rpc.get_latest_blockhash().await?;
         let mut transaction = Transaction::new_with_payer(&instructions, Some(&self.payer.pubkey()));
         transaction.sign(&[&*self.payer], recent_blockhash);
-        let signature = self.rpc.send_and_confirm_transaction(&transaction).await?;
+        let signature = self.infrastructure.rpc.send_and_confirm_transaction(&transaction).await?;
+        Ok(signature.to_string())
+    }
+
+    /// Claim Bonding Curve (Pump) cashback.
+    ///
+    /// Transfers native SOL from the user's UserVolumeAccumulator to the wallet.
+    /// If there is nothing to claim, the transaction may still succeed with no SOL transferred.
+    ///
+    /// # Returns
+    /// * `Ok(String)` - Transaction signature
+    /// * `Err(anyhow::Error)` - Build or send failure (e.g. invalid PDA)
+    pub async fn claim_cashback_pumpfun(&self) -> Result<String, anyhow::Error> {
+        use solana_sdk::transaction::Transaction;
+        let ix = crate::instruction::pumpfun::claim_cashback_pumpfun_instruction(&self.payer.pubkey())
+            .ok_or_else(|| anyhow::anyhow!("Failed to build PumpFun claim_cashback instruction"))?;
+        let recent_blockhash = self.infrastructure.rpc.get_latest_blockhash().await?;
+        let mut transaction = Transaction::new_with_payer(&[ix], Some(&self.payer.pubkey()));
+        transaction.sign(&[&*self.payer], recent_blockhash);
+        let signature = self.infrastructure.rpc.send_and_confirm_transaction(&transaction).await?;
+        Ok(signature.to_string())
+    }
+
+    /// Claim PumpSwap (AMM) cashback.
+    ///
+    /// Transfers WSOL from the UserVolumeAccumulator to the user's WSOL ATA.
+    /// Creates the user's WSOL ATA idempotently if it does not exist, then claims.
+    ///
+    /// # Returns
+    /// * `Ok(String)` - Transaction signature
+    /// * `Err(anyhow::Error)` - Build or send failure
+    pub async fn claim_cashback_pumpswap(&self) -> Result<String, anyhow::Error> {
+        use solana_sdk::transaction::Transaction;
+        let mut instructions = crate::common::fast_fn::create_associated_token_account_idempotent_fast_use_seed(
+            &self.payer.pubkey(),
+            &self.payer.pubkey(),
+            &WSOL_TOKEN_ACCOUNT,
+            &crate::constants::TOKEN_PROGRAM,
+            self.use_seed_optimize,
+        );
+        let ix = crate::instruction::pumpswap::claim_cashback_pumpswap_instruction(
+            &self.payer.pubkey(),
+            WSOL_TOKEN_ACCOUNT,
+            crate::constants::TOKEN_PROGRAM,
+        ).ok_or_else(|| anyhow::anyhow!("Failed to build PumpSwap claim_cashback instruction"))?;
+        instructions.push(ix);
+        let recent_blockhash = self.infrastructure.rpc.get_latest_blockhash().await?;
+        let mut transaction = Transaction::new_with_payer(&instructions, Some(&self.payer.pubkey()));
+        transaction.sign(&[&*self.payer], recent_blockhash);
+        let signature = self.infrastructure.rpc.send_and_confirm_transaction(&transaction).await?;
         Ok(signature.to_string())
     }
 }

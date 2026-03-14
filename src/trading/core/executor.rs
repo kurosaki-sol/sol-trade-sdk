@@ -4,14 +4,17 @@ use solana_sdk::{
     instruction::Instruction, message::AddressLookupTableAccount, pubkey::Pubkey,
     signature::Keypair, signature::Signature,
 };
-use std::{sync::Arc, time::Instant};
+use std::{sync::Arc, time::{Duration, Instant}};
+#[allow(unused_imports)]
+use tracing::{info, trace, warn};
 
 use crate::{
     common::{nonce_cache::DurableNonceInfo, GasFeeStrategy, SolanaRpcClient},
     perf::syscall_bypass::SystemCallBypassManager,
+    swqos::common::poll_any_transaction_confirmation,
     trading::core::{
         async_executor::execute_parallel,
-        execution::{ExecutionPath, InstructionProcessor, Prefetch},
+        execution::{InstructionProcessor, Prefetch},
         traits::TradeExecutor,
     },
     trading::MiddlewareManager,
@@ -20,7 +23,9 @@ use once_cell::sync::Lazy;
 use crate::swqos::TradeType;
 use super::{params::SwapParams, traits::InstructionBuilder};
 
-/// 🚀 全局系统调用绕过管理器
+/// Global syscall bypass manager (reserved for future time/IO optimizations).
+/// 全局系统调用绕过管理器（预留，后续可接入时间/IO 等优化）。
+#[allow(dead_code)]
 static SYSCALL_BYPASS: Lazy<SystemCallBypassManager> = Lazy::new(|| {
     use crate::perf::syscall_bypass::SyscallBypassConfig;
     SystemCallBypassManager::new(SyscallBypassConfig::default())
@@ -44,44 +49,48 @@ impl GenericTradeExecutor {
 
 #[async_trait::async_trait]
 impl TradeExecutor for GenericTradeExecutor {
-    async fn swap(&self, params: SwapParams) -> Result<(bool, Signature, Option<anyhow::Error>)> {
-        let total_start = Instant::now();
+    async fn swap(&self, params: SwapParams) -> Result<(bool, Vec<Signature>, Option<anyhow::Error>)> {
+        // Sample total start only when logging or simulate. 仅在有日志或 simulate 时取起点。
+        let total_start = (params.log_enabled || params.simulate).then(Instant::now);
+        let timing_start_us: Option<i64> = if params.log_enabled {
+            Some(params.grpc_recv_us.unwrap_or_else(crate::common::clock::now_micros))
+        } else {
+            None
+        };
 
-        // 判断买卖方向
         let is_buy = params.trade_type == TradeType::Buy || params.trade_type == TradeType::CreateAndBuy;
 
-        // CPU 预取
         Prefetch::keypair(&params.payer);
 
-        // 构建指令
-        let build_start = Instant::now();
+        // Time build only when log_enabled to avoid cold-path syscalls. 仅 log_enabled 时计时，减少冷路径 syscall。
+        let build_start = params.log_enabled.then(Instant::now);
         let instructions = if is_buy {
             self.instruction_builder.build_buy_instructions(&params).await?
         } else {
             self.instruction_builder.build_sell_instructions(&params).await?
         };
-        let build_elapsed = build_start.elapsed();
+        let _build_elapsed = build_start.map(|s| s.elapsed()).unwrap_or(Duration::ZERO);
 
-        // 指令预处理
         InstructionProcessor::preprocess(&instructions)?;
 
-        // 中间件处理
         let final_instructions = match &params.middleware_manager {
             Some(middleware_manager) => middleware_manager
                 .apply_middlewares_process_protocol_instructions(
                     instructions,
-                    self.protocol_name.to_string(),
+                    self.protocol_name,
                     is_buy,
                 )?,
             None => instructions,
         };
 
-        // 提交前耗时
-        let before_submit_elapsed = total_start.elapsed();
+        let build_end_us = (params.log_enabled && crate::common::sdk_log::sdk_log_enabled())
+            .then(crate::common::clock::now_micros);
+        let _before_submit_elapsed = total_start.as_ref().map(|s| s.elapsed()).unwrap_or(Duration::ZERO);
+        let before_submit_us = (params.log_enabled && crate::common::sdk_log::sdk_log_enabled())
+            .then(crate::common::clock::now_micros);
 
-        // 如果是模拟模式，直接通过 RPC 模拟交易
         if params.simulate {
-            let send_start = Instant::now();
+            let send_start = crate::common::sdk_log::sdk_log_enabled().then(Instant::now);
             let result = simulate_transaction(
                 params.rpc,
                 params.payer,
@@ -89,7 +98,6 @@ impl TradeExecutor for GenericTradeExecutor {
                 params.address_lookup_table_account,
                 params.recent_blockhash,
                 params.durable_nonce,
-                if is_buy { params.data_size_limit } else { 0 },
                 params.middleware_manager,
                 self.protocol_name,
                 is_buy,
@@ -97,85 +105,110 @@ impl TradeExecutor for GenericTradeExecutor {
                 params.gas_fee_strategy,
             )
             .await;
-            let send_elapsed = send_start.elapsed();
-            let total_elapsed = total_start.elapsed();
+            let send_elapsed = send_start.map(|s| s.elapsed()).unwrap_or(Duration::ZERO);
+            let total_elapsed = total_start.as_ref().map(|s| s.elapsed()).unwrap_or(Duration::ZERO);
 
-            // Get performance metrics using fast timestamp
-            let timestamp_ns = SYSCALL_BYPASS.fast_timestamp_nanos();
-
-            // Print all timing metrics at once to avoid blocking critical path
-            println!("[Timestamp] {}ns", timestamp_ns);
-            println!(
-                "[Build Instructions] Time: {:.3}ms ({:.0}μs)",
-                build_elapsed.as_micros() as f64 / 1000.0,
-                build_elapsed.as_micros()
-            );
-            println!(
-                "[Before Submit] {:.3}ms ({:.0}μs)",
-                before_submit_elapsed.as_micros() as f64 / 1000.0,
-                before_submit_elapsed.as_micros()
-            );
-            println!(
-                "[Simulate Transaction] Time: {:.3}ms ({:.0}μs)",
-                send_elapsed.as_micros() as f64 / 1000.0,
-                send_elapsed.as_micros()
-            );
-            println!(
-                "[Total Time] {:.3}ms ({:.0}μs)",
-                total_elapsed.as_micros() as f64 / 1000.0,
-                total_elapsed.as_micros()
-            );
+            if crate::common::sdk_log::sdk_log_enabled() {
+                let dir = if is_buy { "Buy" } else { "Sell" };
+                if let (Some(start_us), Some(end_us)) = (timing_start_us, build_end_us) {
+                    println!(" [SDK] {} build_instructions: {:.4} ms", dir, (end_us - start_us) as f64 / 1000.0);
+                }
+                if let (Some(start_us), Some(end_us)) = (timing_start_us, before_submit_us) {
+                    println!(" [SDK] {} before_submit: {:.4} ms", dir, (end_us - start_us) as f64 / 1000.0);
+                }
+                println!(" [SDK] {} simulate (dry-run): {:.4} ms", dir, send_elapsed.as_secs_f64() * 1000.0);
+                println!(" [SDK] {} total: {:.4} ms", dir, total_elapsed.as_secs_f64() * 1000.0);
+            }
 
             return result;
         }
 
-        // 并行发送交易
-        let send_start = Instant::now();
+        let need_confirm = params.wait_transaction_confirmed;
         let result = execute_parallel(
-            params.swqos_clients.clone(),
+            &params.swqos_clients,
             params.payer,
-            params.rpc,
+            params.rpc.clone(),
             final_instructions,
             params.address_lookup_table_account,
             params.recent_blockhash,
             params.durable_nonce,
-            if is_buy { params.data_size_limit } else { 0 },
             params.middleware_manager,
             self.protocol_name,
             is_buy,
-            params.wait_transaction_confirmed,
+            false, // submit only here; confirmation and log timing handled below
             if is_buy { true } else { params.with_tip },
             params.gas_fee_strategy,
+            params.use_core_affinity,
+            params.check_min_tip,
         )
         .await;
-        let send_elapsed = send_start.elapsed();
-        let total_elapsed = total_start.elapsed();
 
-        // Get performance metrics using fast timestamp
-        let timestamp_ns = SYSCALL_BYPASS.fast_timestamp_nanos();
+        let log_enabled = params.log_enabled && crate::common::sdk_log::sdk_log_enabled();
 
-        // Print all timing metrics at once to avoid blocking critical path
-        println!("[Timestamp] {}ns", timestamp_ns);
-        println!(
-            "[Build Instructions] Time: {:.3}ms ({:.0}μs)",
-            build_elapsed.as_micros() as f64 / 1000.0,
-            build_elapsed.as_micros()
-        );
-        println!(
-            "[Before Submit] {:.3}ms ({:.0}μs)",
-            before_submit_elapsed.as_micros() as f64 / 1000.0,
-            before_submit_elapsed.as_micros()
-        );
-        println!(
-            "[Send Transaction] Time: {:.3}ms ({:.0}μs)",
-            send_elapsed.as_micros() as f64 / 1000.0,
-            send_elapsed.as_micros()
-        );
-        println!(
-            "[Total Time] {:.3}ms ({:.0}μs)",
-            total_elapsed.as_micros() as f64 / 1000.0,
-            total_elapsed.as_micros()
-        );
+        let (ok, signatures, err, submit_timings) = match result {
+            Ok((success, sigs, last_error, timings)) => (
+                success,
+                sigs,
+                last_error.map(|e| anyhow::anyhow!("{}", e)),
+                timings,
+            ),
+            Err(e) => (false, vec![], Some(anyhow::anyhow!("{}", e)), vec![]),
+        };
+        let submit_timings_ref: &[(crate::swqos::SwqosType, i64)] = submit_timings.as_slice();
+
+        let result = if need_confirm {
+            let confirm_result = if let Some(rpc) = params.rpc.as_ref() {
+                if signatures.is_empty() {
+                    (ok, signatures, err)
+                } else {
+                    let poll_res = poll_any_transaction_confirmation(rpc, &signatures, true).await;
+                    let confirm_done_us = log_enabled.then(crate::common::clock::now_micros);
+                    if log_enabled {
+                        let dir = if is_buy { "Buy" } else { "Sell" };
+                        if let Some(start_us) = timing_start_us {
+                            if let Some(end_us) = build_end_us {
+                                println!(" [SDK] {} build_instructions: {:.4} ms", dir, (end_us - start_us) as f64 / 1000.0);
+                            }
+                            if let Some(end_us) = before_submit_us {
+                                println!(" [SDK] {} before_submit: {:.4} ms", dir, (end_us - start_us) as f64 / 1000.0);
+                            }
+                            if let Some(confirm_us) = confirm_done_us {
+                                let total_ms = (confirm_us - start_us) as f64 / 1000.0;
+                                for (swqos_type, submit_done_us) in submit_timings_ref {
+                                    let submit_ms = (*submit_done_us - start_us).max(0) as f64 / 1000.0;
+                                    let confirmed_ms = (confirm_us - *submit_done_us).max(0) as f64 / 1000.0;
+                                    println!(" [SDK] {} {:?} submit: {:.4} ms, confirmed: {:.4} ms, total: {:.4} ms", dir, swqos_type, submit_ms, confirmed_ms, total_ms);
+                                }
+                            }
+                        }
+                    }
+                    match poll_res {
+                        Ok(_) => (true, signatures, None),
+                        Err(e) => (false, signatures, Some(e)),
+                    }
+                }
+            } else {
+                (ok, signatures, err)
+            };
+            Ok(confirm_result)
+        } else {
+            if log_enabled {
+                let dir = if is_buy { "Buy" } else { "Sell" };
+                if let Some(start_us) = timing_start_us {
+                    if let Some(end_us) = build_end_us {
+                        println!(" [SDK] {} build_instructions: {:.4} ms", dir, (end_us - start_us) as f64 / 1000.0);
+                    }
+                    if let Some(end_us) = before_submit_us {
+                        println!(" [SDK] {} before_submit: {:.4} ms", dir, (end_us - start_us) as f64 / 1000.0);
+                    }
+                    for (swqos_type, submit_done_us) in submit_timings_ref {
+                        let submit_ms = (*submit_done_us - start_us).max(0) as f64 / 1000.0;
+                        println!(" [SDK] {} {:?} submit: {:.4} ms, confirmed: -, total: {:.4} ms", dir, swqos_type, submit_ms, submit_ms);
+                    }
+                }
+            }
+            Ok((ok, signatures, err))
+        };
 
         result
     }
@@ -185,7 +218,8 @@ impl TradeExecutor for GenericTradeExecutor {
     }
 }
 
-/// Simulate transaction using RPC client
+/// Simulate mode: single RPC simulation, returns Vec<Signature> for API consistency.
+/// 模拟模式：单次 RPC 模拟，返回 Vec<Signature> 以与 API 一致。
 async fn simulate_transaction(
     rpc: Option<Arc<SolanaRpcClient>>,
     payer: Arc<Keypair>,
@@ -193,13 +227,12 @@ async fn simulate_transaction(
     address_lookup_table_account: Option<AddressLookupTableAccount>,
     recent_blockhash: Option<Hash>,
     durable_nonce: Option<DurableNonceInfo>,
-    data_size_limit: u32,
     middleware_manager: Option<Arc<MiddlewareManager>>,
     protocol_name: &'static str,
     is_buy: bool,
     with_tip: bool,
     gas_fee_strategy: GasFeeStrategy,
-) -> Result<(bool, Signature, Option<anyhow::Error>)> {
+) -> Result<(bool, Vec<Signature>, Option<anyhow::Error>)> {
     use crate::trading::common::build_transaction;
     use solana_client::rpc_config::RpcSimulateTransactionConfig;
     use solana_commitment_config::CommitmentLevel;
@@ -221,23 +254,21 @@ async fn simulate_transaction(
     let unit_limit = default_config.2.cu_limit;
     let unit_price = default_config.2.cu_price;
 
-    // Build transaction for simulation
     let transaction = build_transaction(
-        payer.clone(),
-        Some(rpc.clone()),
+        &payer,
+        Some(&rpc),
         unit_limit,
         unit_price,
-        instructions,
-        address_lookup_table_account,
+        &instructions,
+        address_lookup_table_account.as_ref(),
         recent_blockhash,
-        data_size_limit,
-        middleware_manager,
+        middleware_manager.as_ref(),
         protocol_name,
         is_buy,
-        false, // simulate doesn't need tip instruction
+        false,
         &Pubkey::default(),
         tip,
-        durable_nonce,
+        durable_nonce.as_ref(),
     )
     .await?;
 
@@ -267,44 +298,76 @@ async fn simulate_transaction(
         .clone();
 
     if let Some(err) = simulate_result.value.err {
-        println!("\n========== [Simulation Failed] ==========");
-        println!("Error Type: {:?}", err);
-        println!("Signature: {:?}", signature);
-
-        // Print logs
-        if let Some(logs) = simulate_result.value.logs {
-            println!("\n========== Transaction Logs ==========");
-            for (i, log) in logs.iter().enumerate() {
-                println!("{:3}. {}", i + 1, log);
+        #[cfg(feature = "perf-trace")]
+        {
+            warn!(target: "sol_trade_sdk", "[Simulation Failed] error={:?} signature={:?}", err, signature);
+            if let Some(logs) = &simulate_result.value.logs {
+                trace!(target: "sol_trade_sdk", "Transaction logs: {:?}", logs);
+            }
+            if let Some(units_consumed) = simulate_result.value.units_consumed {
+                trace!(target: "sol_trade_sdk", "Compute Units Consumed: {}", units_consumed);
             }
         }
-
-        // Print account usage
-        if let Some(units_consumed) = simulate_result.value.units_consumed {
-            println!("\n========== Resource Consumption ==========");
-            println!("Compute Units Consumed: {}", units_consumed);
-        }
-
-        println!("=========================================\n");
-        return Ok((false, signature, Some(anyhow::anyhow!("{:?}", err))));
+        return Ok((false, vec![signature], Some(anyhow::anyhow!("{:?}", err))));
     }
 
     // Simulation succeeded
-    println!("\n========== [Simulation Succeeded] ==========");
-    println!("Signature: {:?}", signature);
-
-    if let Some(units_consumed) = simulate_result.value.units_consumed {
-        println!("Compute Units Consumed: {}", units_consumed);
-    }
-
-    if let Some(logs) = simulate_result.value.logs {
-        println!("\n========== Transaction Logs ==========");
-        for (i, log) in logs.iter().enumerate() {
-            println!("{:3}. {}", i + 1, log);
+    #[cfg(feature = "perf-trace")]
+    {
+        info!(target: "sol_trade_sdk", "[Simulation Succeeded] signature={:?}", signature);
+        if let Some(units_consumed) = simulate_result.value.units_consumed {
+            trace!(target: "sol_trade_sdk", "Compute Units Consumed: {}", units_consumed);
+        }
+        if let Some(logs) = &simulate_result.value.logs {
+            trace!(target: "sol_trade_sdk", "Transaction logs: {:?}", logs);
         }
     }
 
-    println!("============================================\n");
+    Ok((true, vec![signature], None))
+}
 
-    Ok((true, signature, None))
+#[cfg(test)]
+mod tests {
+    use crate::swqos::SwqosType;
+
+    /// 运行 `cargo test -p sol-trade-sdk log_timing_preview -- --nocapture` 查看日志打印效果
+    #[test]
+    fn log_timing_preview() {
+        let dir = "Buy";
+        let build_ms = 12.34;
+        let before_submit_ms = 15.67;
+        println!("\n--- 1. 构建指令耗时 / 提交前耗时（各打印一次，统一 ms，保留 4 位小数）---\n");
+        println!(" [SDK] {} build_instructions: {:.4} ms", dir, build_ms);
+        println!(" [SDK] {} before_submit: {:.4} ms", dir, before_submit_ms);
+
+        println!("\n--- 2. 每个 SWQOS 独立耗时：submit=起点→该通道返回, confirmed=该通道提交→链上确认, total=起点→链上确认 ---\n");
+        for (swqos_type, submit_ms, confirmed_ms, total_ms) in [
+            (SwqosType::Jito, 45.12, 83.38, 128.50),
+            (SwqosType::Helius, 52.30, 76.20, 128.50),
+            (SwqosType::ZeroSlot, 48.90, 79.60, 128.50),
+        ] {
+            println!(
+                " [SDK] {} {:?} submit: {:.4} ms, confirmed: {:.4} ms, total: {:.4} ms",
+                dir, swqos_type, submit_ms, confirmed_ms, total_ms
+            );
+        }
+
+        println!("\n--- 3. 不等待链上确认时：每行 total = 该通道 submit 耗时（独立）---\n");
+        for (swqos_type, submit_ms, total_ms) in [
+            (SwqosType::Jito, 44.20, 44.20),
+            (SwqosType::Helius, 51.80, 51.80),
+        ] {
+            println!(
+                " [SDK] {} {:?} submit: {:.4} ms, confirmed: -, total: {:.4} ms",
+                dir, swqos_type, submit_ms, total_ms
+            );
+        }
+
+        println!("\n--- 4. Simulate 模式（build/before_submit 仍从 grpc_recv_us 起算）---\n");
+        println!(" [SDK] {} build_instructions: {:.4} ms", dir, build_ms);
+        println!(" [SDK] {} before_submit: {:.4} ms", dir, before_submit_ms);
+        println!(" [SDK] {} simulate (dry-run): {:.4} ms", dir, 8.50);
+        println!(" [SDK] {} total: {:.4} ms", dir, 36.51);
+        println!();
+    }
 }

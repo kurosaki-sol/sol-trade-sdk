@@ -12,7 +12,7 @@ use sol_trade_sdk::{
     swqos::SwqosConfig,
     trading::{
         core::params::{
-            BonkParams, PumpFunParams, PumpSwapParams, RaydiumAmmV4Params, RaydiumCpmmParams,
+            BonkParams, PumpFunParams, PumpSwapParams, RaydiumAmmV4Params, RaydiumCpmmParams, DexParamEnum,
         },
         factory::DexType,
     },
@@ -475,7 +475,7 @@ async fn check_mint_ata(
 
     let mint_pubkey = Pubkey::from_str(mint).unwrap();
 
-    if let Ok(mint_info) = client.rpc.get_account(&mint_pubkey).await {
+    if let Ok(mint_info) = client.infrastructure.rpc.get_account(&mint_pubkey).await {
         let owner_pubkey = mint_info.owner.clone();
         let mint_ata = get_associated_token_address_with_program_id_fast_use_seed(
             &client.get_payer_pubkey(),
@@ -483,7 +483,7 @@ async fn check_mint_ata(
             &owner_pubkey,
             false,
         );
-        match client.rpc.get_token_account_balance(&mint_ata).await {
+        match client.infrastructure.rpc.get_token_account_balance(&mint_ata).await {
             Ok(balance) => {
                 let amount = balance.ui_amount.unwrap_or(0.0);
                 decimals = balance.decimals;
@@ -504,7 +504,7 @@ async fn check_mint_ata(
             &owner_pubkey,
             true,
         );
-        match client.rpc.get_token_account_balance(&mint_ata).await {
+        match client.infrastructure.rpc.get_token_account_balance(&mint_ata).await {
             Ok(_) => {
                 create_mint_ata = false;
                 use_seed = true;
@@ -531,7 +531,7 @@ async fn handle_buy(
 
     let client = initialize_real_client().await?;
 
-    let (create_mint_ata, use_seed, owner_pubkey, amount_f64, decimals) =
+    let (create_mint_ata, use_seed, owner_pubkey, _amount_f64, _decimals) =
         check_mint_ata(&client, mint).await?;
 
     match dex {
@@ -565,7 +565,7 @@ async fn handle_buy_rv4(
     slippage: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let client = initialize_real_client().await?;
-    let (create_mint_ata, use_seed, owner_pubkey, amount_f64, decimals) =
+    let (create_mint_ata, use_seed, owner_pubkey, _amount_f64, _decimals) =
         check_mint_ata(&client, mint).await?;
     handle_buy_raydium_v4(mint, amm, sol_amount, slippage, create_mint_ata, use_seed, owner_pubkey)
         .await?;
@@ -579,7 +579,7 @@ async fn handle_buy_rcpmm(
     slippage: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let client = initialize_real_client().await?;
-    let (create_mint_ata, use_seed, owner_pubkey, amount_f64, decimals) =
+    let (create_mint_ata, use_seed, owner_pubkey, _amount_f64, _decimals) =
         check_mint_ata(&client, mint).await?;
     handle_buy_raydium_cpmm(
         mint,
@@ -599,8 +599,8 @@ async fn handle_buy_pumpfun(
     sol_amount: f64,
     slippage: Option<u64>,
     create_mint_ata: bool,
-    use_seed: bool,
-    owner_pubkey: Pubkey,
+    _use_seed: bool,
+    _owner_pubkey: Pubkey,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("🔥 BUY PUMPFUN COMMAND");
     println!("   Token Mint: {}", mint);
@@ -610,12 +610,12 @@ async fn handle_buy_pumpfun(
     }
     let client = initialize_real_client().await?;
     let mint_pubkey = Pubkey::from_str(mint)?;
-    let param = PumpFunParams::from_mint_by_rpc(&client.rpc, &mint_pubkey).await?;
-    let recent_blockhash = client.rpc.get_latest_blockhash().await?;
+    let param = PumpFunParams::from_mint_by_rpc(&client.infrastructure.rpc, &mint_pubkey).await?;
+    let recent_blockhash = client.infrastructure.rpc.get_latest_blockhash().await?;
     let sol_lamports = sol_str_to_lamports(sol_amount.to_string().as_str()).unwrap();
 
     let gas_fee_strategy = sol_trade_sdk::common::GasFeeStrategy::new();
-    gas_fee_strategy.set_global_fee_strategy(150000,150000, 500000,500000, 0.001, 0.001, 256 * 1024, 0);
+    gas_fee_strategy.set_global_fee_strategy(150000, 150000, 500000, 500000, 0.001, 0.001);
 
     let buy_params = TradeBuyParams {
         dex_type: DexType::PumpFun,
@@ -624,7 +624,7 @@ async fn handle_buy_pumpfun(
         input_token_amount: sol_lamports,
         slippage_basis_points: slippage,
         recent_blockhash: Some(recent_blockhash),
-        extension_params: Box::new(param),
+        extension_params: DexParamEnum::PumpFun(param),
         address_lookup_table_account: None,
         wait_transaction_confirmed: true,
         create_input_token_ata: false,
@@ -634,6 +634,8 @@ async fn handle_buy_pumpfun(
         fixed_output_token_amount: None,
         gas_fee_strategy: gas_fee_strategy,
         simulate: false,
+        use_exact_sol_amount: None,
+        grpc_recv_us: None,
     };
     match client.buy(buy_params).await {
         Ok((_, signature, _)) => {
@@ -653,7 +655,7 @@ async fn handle_buy_pumpswap(
     sol_amount: f64,
     slippage: Option<u64>,
     create_mint_ata: bool,
-    use_seed: bool,
+    _use_seed: bool,
     _owner_pubkey: Pubkey,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let client = initialize_real_client().await?;
@@ -664,12 +666,12 @@ async fn handle_buy_pumpswap(
         println!("   Slippage: {}%", slippage.unwrap());
     }
     let mint_pubkey = Pubkey::from_str(mint)?;
-    let param = PumpSwapParams::from_mint_by_rpc(&client.rpc, &mint_pubkey).await?;
-    let recent_blockhash = client.rpc.get_latest_blockhash().await?;
+    let param = PumpSwapParams::from_mint_by_rpc(&client.infrastructure.rpc, &mint_pubkey).await?;
+    let recent_blockhash = client.infrastructure.rpc.get_latest_blockhash().await?;
     let sol_lamports = sol_str_to_lamports(sol_amount.to_string().as_str()).unwrap();
 
     let gas_fee_strategy = sol_trade_sdk::common::GasFeeStrategy::new();
-    gas_fee_strategy.set_global_fee_strategy(150000,150000, 500000,500000, 0.001, 0.001, 256 * 1024, 0);
+    gas_fee_strategy.set_global_fee_strategy(150000, 150000, 500000, 500000, 0.001, 0.001);
 
     let buy_params = TradeBuyParams {
         dex_type: DexType::PumpSwap,
@@ -678,7 +680,7 @@ async fn handle_buy_pumpswap(
         input_token_amount: sol_lamports,
         slippage_basis_points: slippage,
         recent_blockhash: Some(recent_blockhash),
-        extension_params: Box::new(param),
+        extension_params: DexParamEnum::PumpSwap(param),
         address_lookup_table_account: None,
         wait_transaction_confirmed: true,
         create_input_token_ata: true,
@@ -688,6 +690,8 @@ async fn handle_buy_pumpswap(
         fixed_output_token_amount: None,
         gas_fee_strategy: gas_fee_strategy,
         simulate: false,
+        use_exact_sol_amount: None,
+        grpc_recv_us: None,
     };
     match client.buy(buy_params).await {
         Ok((_, signature, _)) => {
@@ -706,8 +710,8 @@ async fn handle_buy_bonk(
     sol_amount: f64,
     slippage: Option<u64>,
     create_mint_ata: bool,
-    use_seed: bool,
-    owner_pubkey: Pubkey,
+    _use_seed: bool,
+    _owner_pubkey: Pubkey,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let client = initialize_real_client().await?;
     println!("🔥 BUY BONK COMMAND");
@@ -717,12 +721,12 @@ async fn handle_buy_bonk(
         println!("   Slippage: {}%", slippage.unwrap());
     }
     let mint_pubkey = Pubkey::from_str(mint)?;
-    let param = BonkParams::from_mint_by_rpc(&client.rpc, &mint_pubkey, false).await?;
-    let recent_blockhash = client.rpc.get_latest_blockhash().await?;
+    let param = BonkParams::from_mint_by_rpc(&client.infrastructure.rpc, &mint_pubkey, false).await?;
+    let recent_blockhash = client.infrastructure.rpc.get_latest_blockhash().await?;
     let sol_lamports = sol_str_to_lamports(sol_amount.to_string().as_str()).unwrap();
 
     let gas_fee_strategy = sol_trade_sdk::common::GasFeeStrategy::new();
-    gas_fee_strategy.set_global_fee_strategy(150000,150000, 500000,500000, 0.001, 0.001, 256 * 1024, 0);
+    gas_fee_strategy.set_global_fee_strategy(150000, 150000, 500000, 500000, 0.001, 0.001);
 
     let buy_params = TradeBuyParams {
         dex_type: DexType::Bonk,
@@ -731,7 +735,7 @@ async fn handle_buy_bonk(
         input_token_amount: sol_lamports,
         slippage_basis_points: slippage,
         recent_blockhash: Some(recent_blockhash),
-        extension_params: Box::new(param),
+        extension_params: DexParamEnum::Bonk(param),
         address_lookup_table_account: None,
         wait_transaction_confirmed: true,
         create_input_token_ata: true,
@@ -741,6 +745,8 @@ async fn handle_buy_bonk(
         fixed_output_token_amount: None,
         gas_fee_strategy: gas_fee_strategy,
         simulate: false,
+        use_exact_sol_amount: None,
+        grpc_recv_us: None,
     };
     match client.buy(buy_params).await {
         Ok((_, signature, _)) => {
@@ -760,8 +766,8 @@ async fn handle_buy_raydium_v4(
     sol_amount: f64,
     slippage: Option<u64>,
     create_mint_ata: bool,
-    use_seed: bool,
-    owner_pubkey: Pubkey,
+    _use_seed: bool,
+    _owner_pubkey: Pubkey,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let client = initialize_real_client().await?;
     println!("🔥 BUY RAYDIUM V4 COMMAND");
@@ -774,12 +780,12 @@ async fn handle_buy_raydium_v4(
 
     let mint_pubkey = Pubkey::from_str(mint)?;
     let amm_pubkey = Pubkey::from_str(amm)?;
-    let param = RaydiumAmmV4Params::from_amm_address_by_rpc(&client.rpc, amm_pubkey).await?;
-    let recent_blockhash = client.rpc.get_latest_blockhash().await?;
+    let param = RaydiumAmmV4Params::from_amm_address_by_rpc(&client.infrastructure.rpc, amm_pubkey).await?;
+    let recent_blockhash = client.infrastructure.rpc.get_latest_blockhash().await?;
     let sol_lamports = sol_str_to_lamports(sol_amount.to_string().as_str()).unwrap();
 
     let gas_fee_strategy = sol_trade_sdk::common::GasFeeStrategy::new();
-    gas_fee_strategy.set_global_fee_strategy(150000,150000, 500000,500000, 0.001, 0.001, 256 * 1024, 0);
+    gas_fee_strategy.set_global_fee_strategy(150000, 150000, 500000, 500000, 0.001, 0.001);
 
     let buy_params = TradeBuyParams {
         dex_type: DexType::RaydiumAmmV4,
@@ -788,7 +794,7 @@ async fn handle_buy_raydium_v4(
         input_token_amount: sol_lamports,
         slippage_basis_points: slippage,
         recent_blockhash: Some(recent_blockhash),
-        extension_params: Box::new(param),
+        extension_params: DexParamEnum::RaydiumAmmV4(param),
         address_lookup_table_account: None,
         wait_transaction_confirmed: true,
         create_input_token_ata: true,
@@ -798,6 +804,8 @@ async fn handle_buy_raydium_v4(
         fixed_output_token_amount: None,
         gas_fee_strategy: gas_fee_strategy,
         simulate: false,
+        use_exact_sol_amount: None,
+        grpc_recv_us: None,
     };
     match client.buy(buy_params).await {
         Ok((_, signature, _)) => {
@@ -817,8 +825,8 @@ async fn handle_buy_raydium_cpmm(
     sol_amount: f64,
     slippage: Option<u64>,
     create_mint_ata: bool,
-    use_seed: bool,
-    owner_pubkey: Pubkey,
+    _use_seed: bool,
+    _owner_pubkey: Pubkey,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let client = initialize_real_client().await?;
     println!("🔥 BUY RAYDIUM CPMM COMMAND");
@@ -831,12 +839,12 @@ async fn handle_buy_raydium_cpmm(
 
     let mint_pubkey = Pubkey::from_str(mint)?;
     let pool_pubkey = Pubkey::from_str(pool_address)?;
-    let param = RaydiumCpmmParams::from_pool_address_by_rpc(&client.rpc, &pool_pubkey).await?;
-    let recent_blockhash = client.rpc.get_latest_blockhash().await?;
+    let param = RaydiumCpmmParams::from_pool_address_by_rpc(&client.infrastructure.rpc, &pool_pubkey).await?;
+    let recent_blockhash = client.infrastructure.rpc.get_latest_blockhash().await?;
     let sol_lamports = sol_str_to_lamports(sol_amount.to_string().as_str()).unwrap();
 
     let gas_fee_strategy = sol_trade_sdk::common::GasFeeStrategy::new();
-    gas_fee_strategy.set_global_fee_strategy(150000,150000, 500000,500000, 0.001, 0.001, 256 * 1024, 0);
+    gas_fee_strategy.set_global_fee_strategy(150000, 150000, 500000, 500000, 0.001, 0.001);
 
     let buy_params = TradeBuyParams {
         dex_type: DexType::RaydiumCpmm,
@@ -845,7 +853,7 @@ async fn handle_buy_raydium_cpmm(
         input_token_amount: sol_lamports,
         slippage_basis_points: slippage,
         recent_blockhash: Some(recent_blockhash),
-        extension_params: Box::new(param),
+        extension_params: DexParamEnum::RaydiumCpmm(param),
         address_lookup_table_account: None,
         wait_transaction_confirmed: true,
         create_input_token_ata: true,
@@ -855,6 +863,8 @@ async fn handle_buy_raydium_cpmm(
         fixed_output_token_amount: None,
         gas_fee_strategy: gas_fee_strategy,
         simulate: false,
+        use_exact_sol_amount: None,
+        grpc_recv_us: None,
     };
     match client.buy(buy_params).await {
         Ok((_, signature, _)) => {
@@ -982,11 +992,11 @@ async fn handle_sell_pumpfun(
     mint: &str,
     token_amount: Option<f64>,
     slippage: Option<u64>,
-    create_mint_ata: bool,
-    use_seed: bool,
-    owner_pubkey: Pubkey,
+    _create_mint_ata: bool,
+    _use_seed: bool,
+    _owner_pubkey: Pubkey,
     amount_f64: f64,
-    decimals: u8,
+    _decimals: u8,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let amount = if token_amount.is_some() { token_amount.unwrap() } else { amount_f64 };
 
@@ -999,11 +1009,11 @@ async fn handle_sell_pumpfun(
 
     let client = initialize_real_client().await?;
     let mint_pubkey = Pubkey::from_str(mint)?;
-    let param = PumpFunParams::from_mint_by_rpc(&client.rpc, &mint_pubkey).await?;
-    let recent_blockhash = client.rpc.get_latest_blockhash().await?;
+    let param = PumpFunParams::from_mint_by_rpc(&client.infrastructure.rpc, &mint_pubkey).await?;
+    let recent_blockhash = client.infrastructure.rpc.get_latest_blockhash().await?;
 
     let gas_fee_strategy = sol_trade_sdk::common::GasFeeStrategy::new();
-    gas_fee_strategy.set_global_fee_strategy(150000,150000, 500000,500000, 0.001, 0.001, 256 * 1024, 0);
+    gas_fee_strategy.set_global_fee_strategy(150000, 150000, 500000, 500000, 0.001, 0.001);
 
     let sell_params = TradeSellParams {
         dex_type: DexType::PumpFun,
@@ -1013,7 +1023,7 @@ async fn handle_sell_pumpfun(
         slippage_basis_points: slippage,
         recent_blockhash: Some(recent_blockhash),
         with_tip: false,
-        extension_params: Box::new(param),
+        extension_params: DexParamEnum::PumpFun(param),
         address_lookup_table_account: None,
         wait_transaction_confirmed: true,
         create_output_token_ata: true,
@@ -1023,6 +1033,7 @@ async fn handle_sell_pumpfun(
         fixed_output_token_amount: None,
         gas_fee_strategy: gas_fee_strategy,
         simulate: false,
+        grpc_recv_us: None,
     };
 
     match client.sell(sell_params).await {
@@ -1042,11 +1053,11 @@ async fn handle_sell_pumpswap(
     mint: &str,
     token_amount: Option<f64>,
     slippage: Option<u64>,
-    create_mint_ata: bool,
-    use_seed: bool,
-    owner_pubkey: Pubkey,
+    _create_mint_ata: bool,
+    _use_seed: bool,
+    _owner_pubkey: Pubkey,
     amount_f64: f64,
-    decimals: u8,
+    _decimals: u8,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let amount = if token_amount.is_some() { token_amount.unwrap() } else { amount_f64 };
     println!("🔥 SELL PUMPSWAP COMMAND");
@@ -1057,11 +1068,11 @@ async fn handle_sell_pumpswap(
     }
     let client = initialize_real_client().await?;
     let mint_pubkey = Pubkey::from_str(mint)?;
-    let param = PumpSwapParams::from_mint_by_rpc(&client.rpc, &mint_pubkey).await?;
-    let recent_blockhash = client.rpc.get_latest_blockhash().await?;
+    let param = PumpSwapParams::from_mint_by_rpc(&client.infrastructure.rpc, &mint_pubkey).await?;
+    let recent_blockhash = client.infrastructure.rpc.get_latest_blockhash().await?;
 
     let gas_fee_strategy = sol_trade_sdk::common::GasFeeStrategy::new();
-    gas_fee_strategy.set_global_fee_strategy(150000,150000, 500000,500000, 0.001, 0.001, 256 * 1024, 0);
+    gas_fee_strategy.set_global_fee_strategy(150000, 150000, 500000, 500000, 0.001, 0.001);
 
     let sell_params = TradeSellParams {
         dex_type: DexType::PumpSwap,
@@ -1071,7 +1082,7 @@ async fn handle_sell_pumpswap(
         slippage_basis_points: slippage,
         recent_blockhash: Some(recent_blockhash),
         with_tip: false,
-        extension_params: Box::new(param),
+        extension_params: DexParamEnum::PumpSwap(param),
         address_lookup_table_account: None,
         wait_transaction_confirmed: true,
         create_output_token_ata: true,
@@ -1081,11 +1092,12 @@ async fn handle_sell_pumpswap(
         fixed_output_token_amount: None,
         gas_fee_strategy: gas_fee_strategy,
         simulate: false,
+        grpc_recv_us: None,
     };
     match client.sell(sell_params).await {
         Ok((_, signature, _)) => {
             println!("   ✅ Successfully sold tokens from PumpSwap!");
-            println!("   ✅ Transaction Signature: {}", signature);
+            println!("   ✅ Transaction Signature: {:?}", signature);  
         }
         Err(e) => {
             println!("   ❌ Failed to sell tokens from PumpSwap: {}", e);
@@ -1099,11 +1111,11 @@ async fn handle_sell_bonk(
     mint: &str,
     token_amount: Option<f64>,
     slippage: Option<u64>,
-    create_mint_ata: bool,
-    use_seed: bool,
-    owner_pubkey: Pubkey,
+    _create_mint_ata: bool,
+    _use_seed: bool,
+    _owner_pubkey: Pubkey,
     amount_f64: f64,
-    decimals: u8,
+    _decimals: u8,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let amount = if token_amount.is_some() { token_amount.unwrap() } else { amount_f64 };
     println!("🔥 SELL PUMPSWAP COMMAND");
@@ -1114,11 +1126,11 @@ async fn handle_sell_bonk(
     }
     let client = initialize_real_client().await?;
     let mint_pubkey = Pubkey::from_str(mint)?;
-    let param = BonkParams::from_mint_by_rpc(&client.rpc, &mint_pubkey, false).await?;
-    let recent_blockhash = client.rpc.get_latest_blockhash().await?;
+    let param = BonkParams::from_mint_by_rpc(&client.infrastructure.rpc, &mint_pubkey, false).await?;
+    let recent_blockhash = client.infrastructure.rpc.get_latest_blockhash().await?;
 
     let gas_fee_strategy = sol_trade_sdk::common::GasFeeStrategy::new();
-    gas_fee_strategy.set_global_fee_strategy(150000,150000, 500000,500000, 0.001, 0.001, 256 * 1024, 0);
+    gas_fee_strategy.set_global_fee_strategy(150000, 150000, 500000, 500000, 0.001, 0.001);
 
     let sell_params = TradeSellParams {
         dex_type: DexType::Bonk,
@@ -1128,7 +1140,7 @@ async fn handle_sell_bonk(
         slippage_basis_points: slippage,
         recent_blockhash: Some(recent_blockhash),
         with_tip: false,
-        extension_params: Box::new(param),
+        extension_params: DexParamEnum::Bonk(param),
         address_lookup_table_account: None,
         wait_transaction_confirmed: true,
         create_output_token_ata: true,
@@ -1138,6 +1150,7 @@ async fn handle_sell_bonk(
         fixed_output_token_amount: None,
         gas_fee_strategy: gas_fee_strategy,
         simulate: false,
+        grpc_recv_us: None,
     };
     match client.sell(sell_params).await {
         Ok((_, signature, _)) => {
@@ -1157,11 +1170,11 @@ async fn handle_sell_raydium_v4(
     mint: &str,
     token_amount: Option<f64>,
     slippage: Option<u64>,
-    create_mint_ata: bool,
-    use_seed: bool,
-    owner_pubkey: Pubkey,
+    _create_mint_ata: bool,
+    _use_seed: bool,
+    _owner_pubkey: Pubkey,
     amount_f64: f64,
-    decimals: u8,
+    _decimals: u8,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let amount = if token_amount.is_some() { token_amount.unwrap() } else { amount_f64 };
     println!("🔥 SELL RAYDIUM V4 COMMAND");
@@ -1174,11 +1187,11 @@ async fn handle_sell_raydium_v4(
     let client = initialize_real_client().await?;
     let amm_pubkey = Pubkey::from_str(amm)?;
     let mint_pubkey = Pubkey::from_str(mint)?;
-    let param = RaydiumAmmV4Params::from_amm_address_by_rpc(&client.rpc, amm_pubkey).await?;
-    let recent_blockhash = client.rpc.get_latest_blockhash().await?;
+    let param = RaydiumAmmV4Params::from_amm_address_by_rpc(&client.infrastructure.rpc, amm_pubkey).await?;
+    let recent_blockhash = client.infrastructure.rpc.get_latest_blockhash().await?;
 
     let gas_fee_strategy = sol_trade_sdk::common::GasFeeStrategy::new();
-    gas_fee_strategy.set_global_fee_strategy(150000,150000, 500000,500000, 0.001, 0.001, 256 * 1024, 0);
+    gas_fee_strategy.set_global_fee_strategy(150000, 150000, 500000, 500000, 0.001, 0.001);
 
     let sell_params = TradeSellParams {
         dex_type: DexType::RaydiumAmmV4,
@@ -1188,7 +1201,7 @@ async fn handle_sell_raydium_v4(
         slippage_basis_points: slippage,
         recent_blockhash: Some(recent_blockhash),
         with_tip: false,
-        extension_params: Box::new(param),
+        extension_params: DexParamEnum::RaydiumAmmV4(param),
         address_lookup_table_account: None,
         wait_transaction_confirmed: true,
         create_output_token_ata: true,
@@ -1198,6 +1211,7 @@ async fn handle_sell_raydium_v4(
         fixed_output_token_amount: None,
         gas_fee_strategy: gas_fee_strategy,
         simulate: false,
+        grpc_recv_us: None,
     };
     match client.sell(sell_params).await {
         Ok((_, signature, _)) => {
@@ -1217,11 +1231,11 @@ async fn handle_sell_raydium_cpmm(
     pool_address: &str,
     token_amount: Option<f64>,
     slippage: Option<u64>,
-    create_mint_ata: bool,
-    use_seed: bool,
-    owner_pubkey: Pubkey,
+    _create_mint_ata: bool,
+    _use_seed: bool,
+    _owner_pubkey: Pubkey,
     amount_f64: f64,
-    decimals: u8,
+    _decimals: u8,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let amount = if token_amount.is_some() { token_amount.unwrap() } else { amount_f64 };
     println!("🔥 SELL RAYDIUM CPMM COMMAND");
@@ -1234,11 +1248,11 @@ async fn handle_sell_raydium_cpmm(
     let client = initialize_real_client().await?;
     let pool_pubkey = Pubkey::from_str(pool_address)?;
     let mint_pubkey = Pubkey::from_str(mint)?;
-    let param = RaydiumCpmmParams::from_pool_address_by_rpc(&client.rpc, &pool_pubkey).await?;
-    let recent_blockhash = client.rpc.get_latest_blockhash().await?;
+    let param = RaydiumCpmmParams::from_pool_address_by_rpc(&client.infrastructure.rpc, &pool_pubkey).await?;
+    let recent_blockhash = client.infrastructure.rpc.get_latest_blockhash().await?;
 
     let gas_fee_strategy = sol_trade_sdk::common::GasFeeStrategy::new();
-    gas_fee_strategy.set_global_fee_strategy(150000,150000, 500000,500000, 0.001, 0.001, 256 * 1024, 0);
+    gas_fee_strategy.set_global_fee_strategy(150000, 150000, 500000, 500000, 0.001, 0.001);
 
     let sell_params = TradeSellParams {
         dex_type: DexType::RaydiumCpmm,
@@ -1248,7 +1262,7 @@ async fn handle_sell_raydium_cpmm(
         slippage_basis_points: slippage,
         recent_blockhash: Some(recent_blockhash),
         with_tip: false,
-        extension_params: Box::new(param),
+        extension_params: DexParamEnum::RaydiumCpmm(param),
         address_lookup_table_account: None,
         wait_transaction_confirmed: true,
         create_output_token_ata: true,
@@ -1258,6 +1272,7 @@ async fn handle_sell_raydium_cpmm(
         fixed_output_token_amount: None,
         gas_fee_strategy: gas_fee_strategy,
         simulate: false,
+        grpc_recv_us: None,
     };
     match client.sell(sell_params).await {
         Ok((_, signature, _)) => {
@@ -1420,7 +1435,7 @@ async fn wrap_sol_real(
     ];
 
     // Build and send transaction
-    let recent_blockhash = client.rpc.get_latest_blockhash().await?;
+    let recent_blockhash = client.infrastructure.rpc.get_latest_blockhash().await?;
     let transaction = Transaction::new_signed_with_payer(
         &instructions,
         Some(&client.get_payer_pubkey()),
@@ -1428,7 +1443,7 @@ async fn wrap_sol_real(
         recent_blockhash,
     );
 
-    let signature = client.rpc.send_and_confirm_transaction(&transaction).await?;
+    let signature = client.infrastructure.rpc.send_and_confirm_transaction(&transaction).await?;
     println!("   📝 Transaction Signature: {}", signature);
     Ok(())
 }
@@ -1440,7 +1455,7 @@ async fn close_wsol_real(client: &SolanaTrade) -> Result<(), Box<dyn std::error:
     let wsol_account = get_associated_token_address(&client.get_payer_pubkey(), &wsol_mint);
 
     // Check if WSOL account exists
-    let account_info = client.rpc.get_account(&wsol_account).await;
+    let account_info = client.infrastructure.rpc.get_account(&wsol_account).await;
     if account_info.is_err() {
         return Err("WSOL account not found".into());
     }
@@ -1455,7 +1470,7 @@ async fn close_wsol_real(client: &SolanaTrade) -> Result<(), Box<dyn std::error:
     )?;
 
     // Build and send transaction
-    let recent_blockhash = client.rpc.get_latest_blockhash().await?;
+    let recent_blockhash = client.infrastructure.rpc.get_latest_blockhash().await?;
     let transaction = Transaction::new_signed_with_payer(
         &[close_instruction],
         Some(&client.get_payer_pubkey()),
@@ -1463,7 +1478,7 @@ async fn close_wsol_real(client: &SolanaTrade) -> Result<(), Box<dyn std::error:
         recent_blockhash,
     );
 
-    let signature = client.rpc.send_and_confirm_transaction(&transaction).await?;
+    let signature = client.infrastructure.rpc.send_and_confirm_transaction(&transaction).await?;
     println!("   📝 Transaction Signature: {}", signature);
     Ok(())
 }

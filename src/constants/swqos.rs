@@ -13,6 +13,20 @@ pub const JITO_TIP_ACCOUNTS: &[Pubkey] = &[
     pubkey!("3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT"),
 ];
 
+/// Helius Sender tip accounts (fee recipient addresses).
+pub const HELIUS_TIP_ACCOUNTS: &[Pubkey] = &[
+    pubkey!("4ACfpUFoaSD9bfPdeu6DBt89gB6ENTeHBXCAi87NhDEE"),
+    pubkey!("D2L6yPZ2FmmmTKPgzaMKdhu6EWZcTpLy1Vhx8uvZe7NZ"),
+    pubkey!("9bnz4RShgq1hAnLnZbP8kbgBg1kEmcJBYQq3gQbmnSta"),
+    pubkey!("5VY91ws6B2hMmBFRsXkoAAdsPHBJwRfBht4DXox3xkwn"),
+    pubkey!("2nyhqdwKcJZR2vcqCyrYsaPVdAnFoJjiksCXJ7hfEYgD"),
+    pubkey!("2q5pghRs6arqVjRvT5gfgWfWcHWmw1ZuCzphgd5KfWGJ"),
+    pubkey!("wyvPkWjVZz1M8fHQnMMCDTQDbkManefNNhweYk5WkcF"),
+    pubkey!("3KCKozbAaF75qEU33jtzozcJ29yJuaLJTy2jFdzUY8bT"),
+    pubkey!("4vieeGHPYPG2MmyPRcYjdiDmmhN3ww7hsFNap8pVN3Ey"),
+    pubkey!("4TQLFNWK8AovT1gFvda5jfw2oJeRMKEmw7aH6MGBJ3or"),
+];
+
 pub const NEXTBLOCK_TIP_ACCOUNTS: &[Pubkey] = &[
     pubkey!("NextbLoCkVtMGcV47JzewQdvBpLqT9TxQFozQkN98pE"),
     pubkey!("NexTbLoCkWykbLuB1NkjXgFWkX9oAtcoagQegygXXA2"),
@@ -109,6 +123,38 @@ pub const ASTRALANE_TIP_ACCOUNTS: &[Pubkey] = &[
     pubkey!("astrawVNP4xDBKT7rAdxrLYiTSTdqtUr63fSMduivXK"),
 ];
 
+pub const STELLIUM_TIP_ACCOUNTS: &[Pubkey] = &[
+    pubkey!("ste11JV3MLMM7x7EJUM2sXcJC1H7F4jBLnP9a9PG8PH"),
+    pubkey!("ste11MWPjXCRfQryCshzi86SGhuXjF4Lv6xMXD2AoSt"),
+    pubkey!("ste11p5x8tJ53H1NbNQsRBg1YNRd4GcVpxtDw8PBpmb"),
+    pubkey!("ste11p7e2KLYou5bwtt35H7BM6uMdo4pvioGjJXKFcN"),
+    pubkey!("ste11TMV68LMi1BguM4RQujtbNCZvf1sjsASpqgAvSX"),
+];
+
+// Lightspeed (Solana Vibe Station) tip accounts
+pub const LIGHTSPEED_TIP_ACCOUNTS: &[Pubkey] = &[
+    pubkey!("53PhM3UTdMQWu5t81wcd35AHGc5xpmHoRjem7GQPvXjA"),
+    pubkey!("9tYF5yPDC1NP8s6diiB3kAX6ZZnva9DM3iDwJkBRarBB"),
+];
+
+pub const SOYAS_TIP_ACCOUNTS: &[Pubkey] = &[
+    pubkey!("soyas4s6L8KWZ8rsSk1mF3d1mQScoTGGAgjk98bF8nP"),
+    pubkey!("soyascXFW5wEEYiwfEmHy2pNwomqzvggJosGVD6TJdY"),
+    pubkey!("soyasDBdKjADwPz3xk82U3TNPRDKEWJj7wWLajNHZ1L"),
+    pubkey!("soyasE2abjBAynmHbGWgEwk4ctBy7JMTUCNrMbjcnyH"),
+];
+
+pub const SPEEDLANDING_TIP_ACCOUNTS: &[Pubkey] = &[
+    pubkey!("SpEEdz8S1KorkMZqjMUxfxrmWwofmp6ReNP2Nx6CUmq"),
+    pubkey!("SpeeDy3GJM4wcrQmk1itRFWgidvxX4rwjTLMv78wwjE"),
+    pubkey!("SPeEdva37vW8vRtqgYjprQs1g3965icfVN5Rt7SMAyh"),
+    pubkey!("speEdrSEpox5GUfHWcBc7tQjRuSfUin2yvB7qoYvvJh"),
+    pubkey!("SPeEDmkHkN3A2roSZf6aZyEMsmrGqTHKqwP51y2Y4rV"),
+    pubkey!("SpeedLdTJXh2RKpXEaP8JCxkWoUVXhtdPQ1EnxBJMxc"),
+    pubkey!("SpEediGKLbbXndSYTzwmz6Z3NDgHQLDcTDEvGFkSMH9"),
+    pubkey!("speede8xCcUq2Tiv1efXeTuE3k9TDNq8TnGKaKSc6J4"),
+];
+
 // NewYork,
 // Frankfurt,
 // Amsterdam,
@@ -142,13 +188,13 @@ pub const SWQOS_ENDPOINTS_NEXTBLOCK: [&str; 8] = [
 
 pub const SWQOS_ENDPOINTS_ZERO_SLOT: [&str; 8] = [
     "http://ny.0slot.trade",
-    "http://de.0slot.trade",
+    "http://de2.0slot.trade", // Use de2 for TSW, and de1 for OVH
     "http://ams.0slot.trade",
     "http://ny.0slot.trade",
     "http://jp.0slot.trade",
     "http://ams.0slot.trade",
     "http://la.0slot.trade",
-    "http://de.0slot.trade",
+    "http://de2.0slot.trade", // Use de2 for TSW, and de1 for OVH
 ];
 
 pub const SWQOS_ENDPOINTS_TEMPORAL: [&str; 8] = [
@@ -170,7 +216,7 @@ pub const SWQOS_ENDPOINTS_BLOX: [&str; 8] = [
     "https://tokyo.solana.dex.blxrbdn.com",
     "https://uk.solana.dex.blxrbdn.com",
     "https://la.solana.dex.blxrbdn.com",
-    "https://germany.solana.dex.blxrbdn.com",
+    "https://global.solana.dex.blxrbdn.com",
 ];
 
 pub const SWQOS_ENDPOINTS_NODE1: [&str; 8] = [
@@ -178,10 +224,23 @@ pub const SWQOS_ENDPOINTS_NODE1: [&str; 8] = [
     "http://fra.node1.me",
     "http://ams.node1.me",
     "http://ny.node1.me",
-    "http://fra.node1.me",
-    "http://ams.node1.me",
+    "http://tk.node1.me",
+    "http://lon.node1.me",
     "http://ny.node1.me",
     "http://fra.node1.me",
+];
+
+/// Node1 QUIC: port 16666. Region order: NewYork, Frankfurt, Amsterdam, SLC→ny, Tokyo, London, LosAngeles→ny, Default→ny.
+/// server_name = host part (e.g. ny.node1.me). Auth: first bi stream = 16-byte UUID; each tx = new bi stream, bincode body.
+pub const SWQOS_ENDPOINTS_NODE1_QUIC: [&str; 8] = [
+    "ny.node1.me:16666",
+    "fra.node1.me:16666",
+    "ams.node1.me:16666",
+    "ny.node1.me:16666",   // SLC → ny
+    "tk.node1.me:16666",
+    "lon.node1.me:16666",
+    "ny.node1.me:16666",   // LA → ny
+    "ny.node1.me:16666",   // Default → ny
 ];
 
 pub const SWQOS_ENDPOINTS_FLASHBLOCK: [&str; 8] = [
@@ -195,35 +254,107 @@ pub const SWQOS_ENDPOINTS_FLASHBLOCK: [&str; 8] = [
     "http://ny.flashblock.trade",
 ];
 
+/// BlockRazor Send Transaction v2: plain-text Base64 body, auth in URI, Content-Type: text/plain. Keep-alive: POST /v2/health.
+/// 若 HTTP 返回 500，可尝试 HTTPS：https://<region>.solana.blockrazor.io/v2/sendTransaction（Frankfurt/NewYork/Tokyo），通过 custom_url 覆盖。
 pub const SWQOS_ENDPOINTS_BLOCKRAZOR: [&str; 8] = [
-    "http://newyork.solana.blockrazor.xyz:443/sendTransaction",
-    "http://frankfurt.solana.blockrazor.xyz:443/sendTransaction",
-    "http://amsterdam.solana.blockrazor.xyz:443/sendTransaction",
-    "http://newyork.solana.blockrazor.xyz:443/sendTransaction",
-    "http://tokyo.solana.blockrazor.xyz:443/sendTransaction",
-    "http://frankfurt.solana.blockrazor.xyz:443/sendTransaction",
-    "http://newyork.solana.blockrazor.xyz:443/sendTransaction",
-    "http://frankfurt.solana.blockrazor.xyz:443/sendTransaction",
+    "http://newyork.solana.blockrazor.xyz:443/v2/sendTransaction",
+    "http://frankfurt.solana.blockrazor.xyz:443/v2/sendTransaction",
+    "http://amsterdam.solana.blockrazor.xyz:443/v2/sendTransaction",
+    "http://newyork.solana.blockrazor.xyz:443/v2/sendTransaction",
+    "http://tokyo.solana.blockrazor.xyz:443/v2/sendTransaction",
+    "http://london.solana.blockrazor.xyz:443/v2/sendTransaction",
+    "http://newyork.solana.blockrazor.xyz:443/v2/sendTransaction",
+    "http://frankfurt.solana.blockrazor.xyz:443/v2/sendTransaction",
 ];
 
+/// Astralane binary API path (no Base64; use with ?api-key=...&method=sendTransaction|getHealth).
+pub const ASTRALANE_PATH_IRISB: &str = "irisb";
+
 pub const SWQOS_ENDPOINTS_ASTRALANE: [&str; 8] = [
-    "http://ny.gateway.astralane.io/iris",
-    "http://fr.gateway.astralane.io/iris",
-    "http://ams.gateway.astralane.io/iris",
-    "http://ny.gateway.astralane.io/iris",
-    "http://jp.gateway.astralane.io/iris",
-    "http://ny.gateway.astralane.io/iris",
-    "http://lax.gateway.astralane.io/iris",
-    "http://lim.gateway.astralane.io/iris",
+    "http://ny.gateway.astralane.io/irisb",
+    "http://fr.gateway.astralane.io/irisb",
+    "http://ams.gateway.astralane.io/irisb",
+    "http://ny.gateway.astralane.io/irisb",
+    "http://jp.gateway.astralane.io/irisb",
+    "http://ny.gateway.astralane.io/irisb",
+    "http://lax.gateway.astralane.io/irisb",
+    "http://lim.gateway.astralane.io/irisb",
+];
+
+/// Astralane QUIC endpoints (port 7000). Region order: NewYork, Frankfurt, Amsterdam, SLC, Tokyo, London, LosAngeles, Default.
+/// See: https://github.com/Astralane/astralane-quic-client. We use fr, ams, la, ny, lim, sg only (avoid ams2/fr2 for lower latency).
+pub const SWQOS_ENDPOINTS_ASTRALANE_QUIC: [&str; 8] = [
+    "ny.gateway.astralane.io:7000",   // NewYork
+    "fr.gateway.astralane.io:7000",   // Frankfurt
+    "ams.gateway.astralane.io:7000",  // Amsterdam
+    "lim.gateway.astralane.io:7000",  // SLC (no slc, use lim)
+    "sg.gateway.astralane.io:7000",   // Tokyo (Asia)
+    "ams.gateway.astralane.io:7000",  // London (Europe, avoid ams2)
+    "la.gateway.astralane.io:7000",   // LosAngeles
+    "lim.gateway.astralane.io:7000",  // Default
+];
+
+pub const SWQOS_ENDPOINTS_STELLIUM: [&str; 8] = [
+    "http://ewr1.flashrpc.com",
+    "http://fra1.flashrpc.com",
+    "http://ams1.flashrpc.com",
+    "http://ewr1.flashrpc.com",
+    "http://tyo1.flashrpc.com",
+    "http://lhr1.flashrpc.com",
+    "http://ewr1.flashrpc.com",
+    "http://fra1.flashrpc.com",
+];
+
+pub const SWQOS_ENDPOINTS_SOYAS: [&str; 8] = [
+    "nyc.landing.soyas.xyz:9000",
+    "fra.landing.soyas.xyz:9000",
+    "ams.landing.soyas.xyz:9000",
+    "nyc.landing.soyas.xyz:9000",
+    "tyo.landing.soyas.xyz:9000",
+    "lon.landing.soyas.xyz:9000",
+    "nyc.landing.soyas.xyz:9000",
+    "fra.landing.soyas.xyz:9000",
+];
+
+pub const SWQOS_ENDPOINTS_SPEEDLANDING: [&str; 8] = [
+    "nyc.speedlanding.trade:17778",
+    "fra.speedlanding.trade:17778",
+    "ams.speedlanding.trade:17778",
+    "nyc.speedlanding.trade:17778",
+    "tyo.speedlanding.trade:17778",
+    "fra.speedlanding.trade:17778",
+    "nyc.speedlanding.trade:17778",
+    "fra.speedlanding.trade:17778",
+];
+
+/// Helius Sender: POST /fast, dual routing to validators and Jito. API key optional (custom TPS only).
+/// Region order: NewYork(EWR), Frankfurt, Amsterdam, SLC, Tokyo, London, LosAngeles(SG), Default(Global).
+pub const SWQOS_ENDPOINTS_HELIUS: [&str; 8] = [
+    "http://ewr-sender.helius-rpc.com/fast",
+    "http://fra-sender.helius-rpc.com/fast",
+    "http://ams-sender.helius-rpc.com/fast",
+    "http://slc-sender.helius-rpc.com/fast",
+    "http://tyo-sender.helius-rpc.com/fast",
+    "http://lon-sender.helius-rpc.com/fast",
+    "http://sg-sender.helius-rpc.com/fast",
+    "https://sender.helius-rpc.com/fast",
 ];
 
 pub const SWQOS_MIN_TIP_DEFAULT: f64 = 0.00001; // 其它SWQOS默认最低小费
-pub const SWQOS_MIN_TIP_JITO: f64 = SWQOS_MIN_TIP_DEFAULT;
-pub const SWQOS_MIN_TIP_NEXTBLOCK: f64 = SWQOS_MIN_TIP_DEFAULT;
-pub const SWQOS_MIN_TIP_ZERO_SLOT: f64 = SWQOS_MIN_TIP_DEFAULT;
-pub const SWQOS_MIN_TIP_TEMPORAL: f64 = SWQOS_MIN_TIP_DEFAULT;
-pub const SWQOS_MIN_TIP_BLOXROUTE: f64 = SWQOS_MIN_TIP_DEFAULT;
-pub const SWQOS_MIN_TIP_NODE1: f64 = 0.002; // 如需更高阈值可调整
-pub const SWQOS_MIN_TIP_FLASHBLOCK: f64 = SWQOS_MIN_TIP_DEFAULT;
-pub const SWQOS_MIN_TIP_BLOCKRAZOR: f64 = SWQOS_MIN_TIP_DEFAULT;
-pub const SWQOS_MIN_TIP_ASTRALANE: f64 = SWQOS_MIN_TIP_DEFAULT;
+pub const SWQOS_MIN_TIP_JITO: f64 = 0.00001;
+pub const SWQOS_MIN_TIP_NEXTBLOCK: f64 = 0.001;
+pub const SWQOS_MIN_TIP_ZERO_SLOT: f64 = 0.0001;
+pub const SWQOS_MIN_TIP_TEMPORAL: f64 = 0.0001;
+pub const SWQOS_MIN_TIP_BLOXROUTE: f64 = 0.0001;
+pub const SWQOS_MIN_TIP_NODE1: f64 = 0.0001; // 如需更高阈值可调整
+pub const SWQOS_MIN_TIP_FLASHBLOCK: f64 = 0.0001;
+pub const SWQOS_MIN_TIP_BLOCKRAZOR: f64 = 0.0001;
+pub const SWQOS_MIN_TIP_ASTRALANE: f64 = 0.00001;
+pub const SWQOS_MIN_TIP_STELLIUM: f64 = 0.0001; // Stellium requires minimum 0.001 SOL tip
+pub const SWQOS_MIN_TIP_LIGHTSPEED: f64 = 0.0001; // Lightspeed requires minimum 0.001 SOL tip
+pub const SWQOS_MIN_TIP_SOYAS: f64 = 0.001; // Soyas requires minimum 0.001 SOL tip
+pub const SWQOS_MIN_TIP_SPEEDLANDING: f64 = 0.001; // Speedlanding requires minimum 0.001 SOL tip
+/// Helius Sender: 0.0002 SOL when not swqos_only; use SWQOS_MIN_TIP_HELIUS_SWQOS_ONLY when swqos_only=true.
+pub const SWQOS_MIN_TIP_HELIUS: f64 = 0.0002;
+/// Helius Sender with swqos_only: minimum 0.000005 SOL (much lower tip allowed).
+pub const SWQOS_MIN_TIP_HELIUS_SWQOS_ONLY: f64 = 0.000005;

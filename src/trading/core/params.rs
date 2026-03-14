@@ -1,4 +1,3 @@
-use super::traits::ProtocolParams;
 use crate::common::bonding_curve::BondingCurveAccount;
 use crate::common::nonce_cache::DurableNonceInfo;
 use crate::common::spl_associated_token_account::get_associated_token_address_with_program_id;
@@ -14,6 +13,32 @@ use solana_sdk::message::AddressLookupTableAccount;
 use solana_sdk::{pubkey::Pubkey, signature::Keypair};
 use std::sync::Arc;
 
+/// DEX 参数枚举 - 零开销抽象替代 Box<dyn ProtocolParams>
+#[derive(Clone)]
+pub enum DexParamEnum {
+    PumpFun(PumpFunParams),
+    PumpSwap(PumpSwapParams),
+    Bonk(BonkParams),
+    RaydiumCpmm(RaydiumCpmmParams),
+    RaydiumAmmV4(RaydiumAmmV4Params),
+    MeteoraDammV2(MeteoraDammV2Params),
+}
+
+impl DexParamEnum {
+    /// 获取内部参数的 Any 引用，用于向后兼容的类型检查
+    #[inline]
+    pub fn as_any(&self) -> &dyn std::any::Any {
+        match self {
+            DexParamEnum::PumpFun(p) => p,
+            DexParamEnum::PumpSwap(p) => p,
+            DexParamEnum::Bonk(p) => p,
+            DexParamEnum::RaydiumCpmm(p) => p,
+            DexParamEnum::RaydiumAmmV4(p) => p,
+            DexParamEnum::MeteoraDammV2(p) => p,
+        }
+    }
+}
+
 /// Swap parameters
 #[derive(Clone)]
 pub struct SwapParams {
@@ -28,9 +53,8 @@ pub struct SwapParams {
     pub slippage_basis_points: Option<u64>,
     pub address_lookup_table_account: Option<AddressLookupTableAccount>,
     pub recent_blockhash: Option<Hash>,
-    pub data_size_limit: u32,
     pub wait_transaction_confirmed: bool,
-    pub protocol_params: Box<dyn ProtocolParams>,
+    pub protocol_params: DexParamEnum,
     pub open_seed_optimize: bool,
     pub swqos_clients: Vec<Arc<SwqosClient>>,
     pub middleware_manager: Option<Arc<MiddlewareManager>>,
@@ -43,20 +67,40 @@ pub struct SwapParams {
     pub fixed_output_amount: Option<u64>,
     pub gas_fee_strategy: GasFeeStrategy,
     pub simulate: bool,
+    /// Whether to output SDK logs (from TradeConfig.log_enabled).
+    pub log_enabled: bool,
+    /// Whether to pin parallel submit tasks to cores (from TradeConfig.use_core_affinity).
+    pub use_core_affinity: bool,
+    /// Whether to check minimum tip per SWQOS (from TradeConfig.check_min_tip). When false, skip filter for lower latency.
+    pub check_min_tip: bool,
+    /// Optional event receive time in microseconds (same scale as sol-parser-sdk clock::now_micros). Used as timing start when log_enabled.
+    pub grpc_recv_us: Option<i64>,
+    /// Use exact SOL amount instructions (buy_exact_sol_in for PumpFun, buy_exact_quote_in for PumpSwap).
+    /// When Some(true) or None (default), the exact SOL/quote amount is spent and slippage is applied to output tokens.
+    /// When Some(false), uses regular buy instruction where slippage is applied to SOL/quote input.
+    /// This option only applies to PumpFun and PumpSwap DEXes; it is ignored for other DEXes.
+    pub use_exact_sol_amount: Option<bool>,
 }
 
 impl std::fmt::Debug for SwapParams {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "SwapParams: {:?}", self)
+        write!(f, "SwapParams: ...")
     }
 }
 
 /// PumpFun protocol specific parameters
-/// Configuration parameters specific to PumpFun trading protocol
+/// Configuration parameters specific to PumpFun trading protocol.
+///
+/// **Creator Rewards Sharing**: Some coins use a dynamic `creator_vault` (fee-sharing config).
+/// Always use the latest on-chain creator/vault when building params for **sell**; do not reuse
+/// cached params from buy. Either fetch fresh data via RPC, or pass `creator_vault` from gRPC
+/// using [`from_trade`](PumpFunParams::from_trade) / [`from_dev_trade`](PumpFunParams::from_dev_trade),
+/// or override with [`with_creator_vault`](PumpFunParams::with_creator_vault).
 #[derive(Clone)]
 pub struct PumpFunParams {
     pub bonding_curve: Arc<BondingCurveAccount>,
     pub associated_bonding_curve: Pubkey,
+    /// Creator vault PDA. For Creator Rewards Sharing coins this can change; pass latest from gRPC when selling.
     pub creator_vault: Pubkey,
     pub token_program: Pubkey,
     /// Whether to close token account when selling, only effective during sell operations
@@ -78,6 +122,8 @@ impl PumpFunParams {
         }
     }
 
+    /// When building from event/parser (e.g. sol-parser-sdk), pass `is_cashback_coin` from the event
+    /// so that sell instructions include the correct remaining accounts for cashback.
     pub fn from_dev_trade(
         mint: Pubkey,
         token_amount: u64,
@@ -89,6 +135,7 @@ impl PumpFunParams {
         close_token_account_when_sell: Option<bool>,
         fee_recipient: Pubkey,
         token_program: Pubkey,
+        is_cashback_coin: bool,
     ) -> Self {
         let is_mayhem_mode = fee_recipient == MAYHEM_FEE_RECIPIENT;
         let bonding_curve_account = BondingCurveAccount::from_dev_trade(
@@ -98,6 +145,7 @@ impl PumpFunParams {
             max_sol_cost,
             creator,
             is_mayhem_mode,
+            is_cashback_coin,
         );
         Self {
             bonding_curve: Arc::new(bonding_curve_account),
@@ -108,6 +156,8 @@ impl PumpFunParams {
         }
     }
 
+    /// When building from event/parser (e.g. sol-parser-sdk), pass `is_cashback_coin` from the event
+    /// so that sell instructions include the correct remaining accounts for cashback.
     pub fn from_trade(
         bonding_curve: Pubkey,
         associated_bonding_curve: Pubkey,
@@ -121,6 +171,7 @@ impl PumpFunParams {
         close_token_account_when_sell: Option<bool>,
         fee_recipient: Pubkey,
         token_program: Pubkey,
+        is_cashback_coin: bool,
     ) -> Self {
         let is_mayhem_mode = fee_recipient == MAYHEM_FEE_RECIPIENT;
         let bonding_curve = BondingCurveAccount::from_trade(
@@ -132,6 +183,7 @@ impl PumpFunParams {
             real_token_reserves,
             real_sol_reserves,
             is_mayhem_mode,
+            is_cashback_coin,
         );
         Self {
             bonding_curve: Arc::new(bonding_curve),
@@ -160,6 +212,7 @@ impl PumpFunParams {
             complete: account.0.complete,
             creator: account.0.creator,
             is_mayhem_mode: account.0.is_mayhem_mode,
+            is_cashback_coin: account.0.is_cashback_coin,
         };
         let associated_bonding_curve = get_associated_token_address_with_program_id(
             &bonding_curve.account,
@@ -176,15 +229,13 @@ impl PumpFunParams {
             token_program: mint_account.owner,
         })
     }
-}
 
-impl ProtocolParams for PumpFunParams {
-    fn as_any(&self) -> &dyn std::any::Any {
+    /// Override `creator_vault` with a value from gRPC/event (e.g. for Creator Rewards Sharing).
+    /// Use when selling so the instruction uses the latest on-chain vault and avoids "seeds constraint violated" (2006).
+    #[inline]
+    pub fn with_creator_vault(mut self, creator_vault: Pubkey) -> Self {
+        self.creator_vault = creator_vault;
         self
-    }
-
-    fn clone_box(&self) -> Box<dyn ProtocolParams> {
-        Box::new(self.clone())
     }
 }
 
@@ -224,6 +275,8 @@ pub struct PumpSwapParams {
     pub quote_token_program: Pubkey,
     /// Whether the pool is in mayhem mode
     pub is_mayhem_mode: bool,
+    /// Whether the pool's coin has cashback enabled
+    pub is_cashback_coin: bool,
 }
 
 impl PumpSwapParams {
@@ -240,6 +293,7 @@ impl PumpSwapParams {
         base_token_program: Pubkey,
         quote_token_program: Pubkey,
         fee_recipient: Pubkey,
+        is_cashback_coin: bool,
     ) -> Self {
         let is_mayhem_mode = fee_recipient == MAYHEM_FEE_RECIPIENT_SWAP;
         Self {
@@ -255,7 +309,49 @@ impl PumpSwapParams {
             base_token_program,
             quote_token_program,
             is_mayhem_mode,
+            is_cashback_coin,
         }
+    }
+
+    /// Fast-path constructor for building PumpSwap parameters directly from decoded
+    /// trade/event data and the accompanying instruction accounts, avoiding RPC
+    /// lookups and associated latency. Token program IDs should be sourced from
+    /// the instruction accounts themselves to respect Token Program vs Token-2022
+    /// differences.
+    ///
+    /// When building from event/parser (e.g. sol-parser-sdk), pass `is_cashback_coin`
+    /// from the event so that buy/sell instructions include the correct remaining
+    /// accounts for cashback.
+    pub fn from_trade(
+        pool: Pubkey,
+        base_mint: Pubkey,
+        quote_mint: Pubkey,
+        pool_base_token_account: Pubkey,
+        pool_quote_token_account: Pubkey,
+        pool_base_token_reserves: u64,
+        pool_quote_token_reserves: u64,
+        coin_creator_vault_ata: Pubkey,
+        coin_creator_vault_authority: Pubkey,
+        base_token_program: Pubkey,
+        quote_token_program: Pubkey,
+        fee_recipient: Pubkey,
+        is_cashback_coin: bool,
+    ) -> Self {
+        Self::new(
+            pool,
+            base_mint,
+            quote_mint,
+            pool_base_token_account,
+            pool_quote_token_account,
+            pool_base_token_reserves,
+            pool_quote_token_reserves,
+            coin_creator_vault_ata,
+            coin_creator_vault_authority,
+            base_token_program,
+            quote_token_program,
+            fee_recipient,
+            is_cashback_coin,
+        )
     }
 
     pub async fn from_mint_by_rpc(
@@ -302,7 +398,7 @@ impl PumpSwapParams {
         );
 
         Ok(Self {
-            pool: pool_address.clone(),
+            pool: *pool_address,
             base_mint: pool_data.base_mint,
             quote_mint: pool_data.quote_mint,
             pool_base_token_account: pool_data.pool_base_token_account,
@@ -316,6 +412,7 @@ impl PumpSwapParams {
             } else {
                 crate::constants::TOKEN_PROGRAM_2022
             },
+            is_cashback_coin: pool_data.is_cashback_coin,
             quote_token_program: if pool_data.pool_quote_token_account == quote_token_program_ata {
                 crate::constants::TOKEN_PROGRAM
             } else {
@@ -323,16 +420,6 @@ impl PumpSwapParams {
             },
             is_mayhem_mode: pool_data.is_mayhem_mode,
         })
-    }
-}
-
-impl ProtocolParams for PumpSwapParams {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn clone_box(&self) -> Box<dyn ProtocolParams> {
-        Box::new(self.clone())
     }
 }
 
@@ -512,16 +599,6 @@ impl BonkParams {
     }
 }
 
-impl ProtocolParams for BonkParams {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn clone_box(&self) -> Box<dyn ProtocolParams> {
-        Box::new(self.clone())
-    }
-}
-
 /// RaydiumCpmm protocol specific parameters
 /// Configuration parameters specific to Raydium CPMM trading protocol
 #[derive(Clone)]
@@ -594,7 +671,7 @@ impl RaydiumCpmmParams {
             )
             .await?;
         Ok(Self {
-            pool_state: pool_address.clone(),
+            pool_state: *pool_address,
             amm_config: pool.amm_config,
             base_mint: pool.token0_mint,
             quote_mint: pool.token1_mint,
@@ -606,16 +683,6 @@ impl RaydiumCpmmParams {
             quote_token_program: pool.token1_program,
             observation_state: pool.observation_key,
         })
-    }
-}
-
-impl ProtocolParams for RaydiumCpmmParams {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn clone_box(&self) -> Box<dyn ProtocolParams> {
-        Box::new(self.clone())
     }
 }
 
@@ -670,16 +737,6 @@ impl RaydiumAmmV4Params {
     }
 }
 
-impl ProtocolParams for RaydiumAmmV4Params {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn clone_box(&self) -> Box<dyn ProtocolParams> {
-        Box::new(self.clone())
-    }
-}
-
 /// MeteoraDammV2 protocol specific parameters
 /// Configuration parameters specific to Meteora Damm V2 trading protocol
 #[derive(Clone)]
@@ -721,7 +778,7 @@ impl MeteoraDammV2Params {
         let pool_data =
             crate::instruction::utils::meteora_damm_v2::fetch_pool(rpc, pool_address).await?;
         Ok(Self {
-            pool: pool_address.clone(),
+            pool: *pool_address,
             token_a_vault: pool_data.token_a_vault,
             token_b_vault: pool_data.token_b_vault,
             token_a_mint: pool_data.token_a_mint,
@@ -729,15 +786,5 @@ impl MeteoraDammV2Params {
             token_a_program: TOKEN_PROGRAM,
             token_b_program: TOKEN_PROGRAM,
         })
-    }
-}
-
-impl ProtocolParams for MeteoraDammV2Params {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn clone_box(&self) -> Box<dyn ProtocolParams> {
-        Box::new(self.clone())
     }
 }

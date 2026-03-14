@@ -4,7 +4,7 @@
 </div>
 
 <p align="center">
-    <strong>Integrate PumpFun, PumpSwap, Bonk, Raydium, and Meteora trading functionality into your applications with powerful tools and unified interfaces.</strong>
+    <strong>A high-performance Rust SDK for low-latency Solana DEX trading bots. Built for speed and efficiency, it enables seamless, high-throughput interaction with PumpFun, Pump AMM (PumpSwap), Bonk, Meteora DAMM v2, Raydium AMM v4, and Raydium CPMM for latency-critical trading strategies.</strong>
 </p>
 
 <p align="center">
@@ -47,10 +47,12 @@
   - [📋 Example Usage](#-example-usage)
   - [⚡ Trading Parameters](#-trading-parameters)
   - [📊 Usage Examples Summary Table](#-usage-examples-summary-table)
-  - [⚙️ SWQOS Service Configuration](#️-swqos-service-configuration)
+  - [⚙️ SWQoS Service Configuration](#️-swqos-service-configuration)
+  - [Astralane QUIC (Low-Latency)](#astralane-quic-low-latency)
   - [🔧 Middleware System](#-middleware-system)
   - [🔍 Address Lookup Tables](#-address-lookup-tables)
   - [🔍 Nonce Cache](#-nonce-cache)
+- [💰 Cashback Support (PumpFun / PumpSwap)](#-cashback-support-pumpfun--pumpswap)
 - [🛡️ MEV Protection Services](#️-mev-protection-services)
 - [📁 Project Structure](#-project-structure)
 - [📄 License](#-license)
@@ -71,6 +73,7 @@
 8. **Concurrent Trading**: Send transactions using multiple MEV services simultaneously; the fastest succeeds while others fail
 9. **Unified Trading Interface**: Use unified trading protocol enums for trading operations
 10. **Middleware System**: Support for custom instruction middleware to modify, add, or remove instructions before transaction execution
+11. **Shared Infrastructure**: Share expensive RPC and SWQoS clients across multiple wallets for reduced resource usage
 
 ## 📦 Installation
 
@@ -87,55 +90,69 @@ Add the dependency to your `Cargo.toml`:
 
 ```toml
 # Add to your Cargo.toml
-sol-trade-sdk = { path = "./sol-trade-sdk", version = "3.3.5" }
+sol-trade-sdk = { path = "./sol-trade-sdk", version = "3.6.2" }
 ```
 
 ### Use crates.io
 
 ```toml
 # Add to your Cargo.toml
-sol-trade-sdk = "3.3.5"
+sol-trade-sdk = "3.6.2"
 ```
 
 ## 🛠️ Usage Examples
 
 ### 📋 Example Usage
 
-#### 1. Create SolanaTrade Instance
+#### 1. Create TradingClient Instance
 
-You can refer to [Example: Create SolanaTrade Instance](examples/trading_client/src/main.rs).
+You can refer to [Example: Create TradingClient Instance](examples/trading_client/src/main.rs).
 
+**Method 1: Simple (single wallet)**
 ```rust
 // Wallet
 let payer = Keypair::from_base58_string("use_your_payer_keypair_here");
 // RPC URL
 let rpc_url = "https://mainnet.helius-rpc.com/?api-key=xxxxxx".to_string();
 let commitment = CommitmentConfig::processed();
-// Multiple SWQOS services can be configured
+// Multiple SWQoS services can be configured
 let swqos_configs: Vec<SwqosConfig> = vec![
     SwqosConfig::Default(rpc_url.clone()),
     SwqosConfig::Jito("your uuid".to_string(), SwqosRegion::Frankfurt, None),
-    SwqosConfig::NextBlock("your api_token".to_string(), SwqosRegion::Frankfurt, None),
     SwqosConfig::Bloxroute("your api_token".to_string(), SwqosRegion::Frankfurt, None),
-    SwqosConfig::ZeroSlot("your api_token".to_string(), SwqosRegion::Frankfurt, None),
-    SwqosConfig::Temporal("your api_token".to_string(), SwqosRegion::Frankfurt, None),
-    SwqosConfig::FlashBlock("your api_token".to_string(), SwqosRegion::Frankfurt, None),
-    SwqosConfig::Node1("your api_token".to_string(), SwqosRegion::Frankfurt, None),
-    SwqosConfig::BlockRazor("your api_token".to_string(), SwqosRegion::Frankfurt, None),
-    SwqosConfig::Astralane("your api_token".to_string(), SwqosRegion::Frankfurt, None),
+    // Astralane: HTTP (4th param None) or QUIC (Some(SwqosTransport::Quic)); same API key
+    SwqosConfig::Astralane("your_astralane_api_key".to_string(), SwqosRegion::Frankfurt, None, None), // HTTP
+    SwqosConfig::Astralane(
+        "your_astralane_api_key".to_string(),
+        SwqosRegion::Frankfurt,
+        None,
+        Some(SwqosTransport::Quic),
+    ), // QUIC
 ];
 // Create TradeConfig instance
 let trade_config = TradeConfig::new(rpc_url, swqos_configs, commitment);
 
-// Optional: Customize WSOL ATA and Seed optimization settings
+// Optional: customize WSOL ATA and seed optimization
 // let trade_config = TradeConfig::new(rpc_url, swqos_configs, commitment)
-//     .with_wsol_ata_config(
-//         true,  // create_wsol_ata_on_startup: Check and create WSOL ATA on startup (default: true)
-//         true   // use_seed_optimize: Enable seed optimization globally for all ATA operations (default: true)
-//     );
+//     .with_wsol_ata_config(true, true);  // create_wsol_ata_on_startup, use_seed_optimize
 
-// Create SolanaTrade client
-let client = SolanaTrade::new(Arc::new(payer), trade_config).await;
+// Create TradingClient
+let client = TradingClient::new(Arc::new(payer), trade_config).await;
+```
+
+**Method 2: Shared infrastructure (multiple wallets)**
+
+For multi-wallet scenarios, create the infrastructure once and share it across wallets.
+See [Example: Shared Infrastructure](examples/shared_infrastructure/src/main.rs).
+
+```rust
+// Create infrastructure once (expensive)
+let infra_config = InfrastructureConfig::new(rpc_url, swqos_configs, commitment);
+let infrastructure = Arc::new(TradingInfrastructure::new(infra_config).await);
+
+// Create multiple clients sharing the same infrastructure (fast)
+let client1 = TradingClient::from_infrastructure(Arc::new(payer1), infrastructure.clone(), true);
+let client2 = TradingClient::from_infrastructure(Arc::new(payer2), infrastructure.clone(), true);
 ```
 
 #### 2. Configure Gas Fee Strategy
@@ -146,7 +163,7 @@ For detailed information about Gas Fee Strategy, see the [Gas Fee Strategy Refer
 // Create GasFeeStrategy instance
 let gas_fee_strategy = GasFeeStrategy::new();
 // Set global strategy
-gas_fee_strategy.set_global_fee_strategy(150000,150000, 500000,500000, 0.001, 0.001, 256 * 1024, 0);
+gas_fee_strategy.set_global_fee_strategy(150000, 150000, 500000, 500000, 0.001, 0.001);
 ```
 
 #### 3. Build Trading Parameters
@@ -154,6 +171,9 @@ gas_fee_strategy.set_global_fee_strategy(150000,150000, 500000,500000, 0.001, 0.
 For detailed information about all trading parameters, see the [Trading Parameters Reference](docs/TRADING_PARAMETERS.md).
 
 ```rust
+// Import DexParamEnum for protocol-specific parameters
+use sol_trade_sdk::trading::core::params::DexParamEnum;
+
 let buy_params = sol_trade_sdk::TradeBuyParams {
   dex_type: DexType::PumpSwap,
   input_token_type: TradeTokenType::WSOL,
@@ -161,14 +181,18 @@ let buy_params = sol_trade_sdk::TradeBuyParams {
   input_token_amount: buy_sol_amount,
   slippage_basis_points: slippage_basis_points,
   recent_blockhash: Some(recent_blockhash),
-  extension_params: Box::new(params.clone()),
+  // Use DexParamEnum for type-safe protocol parameters (zero-overhead abstraction)
+  extension_params: DexParamEnum::PumpSwap(params.clone()),
   address_lookup_table_account: None,
   wait_transaction_confirmed: true,
   create_input_token_ata: true,
   close_input_token_ata: true,
   create_mint_ata: true,
   durable_nonce: None,
-  // Note: seed optimization is now configured globally in TradeConfig
+  fixed_output_token_amount: None,  // Optional: specify exact output amount
+  gas_fee_strategy: gas_fee_strategy.clone(),  // Gas fee strategy configuration
+  simulate: false,  // Set to true for simulation only
+  use_exact_sol_amount: None,  // Use exact SOL input for PumpFun/PumpSwap (defaults to true)
 };
 ```
 
@@ -191,7 +215,8 @@ Please ensure that the parameters your trading logic depends on are available in
 
 | Description | Run Command | Source Code |
 |-------------|-------------|-------------|
-| Create and configure SolanaTrade instance | `cargo run --package trading_client` | [examples/trading_client](https://github.com/0xfnzero/sol-trade-sdk/tree/main/examples/trading_client/src/main.rs) |
+| Create and configure TradingClient instance | `cargo run --package trading_client` | [examples/trading_client](https://github.com/0xfnzero/sol-trade-sdk/tree/main/examples/trading_client/src/main.rs) |
+| Share infrastructure across multiple wallets | `cargo run --package shared_infrastructure` | [examples/shared_infrastructure](https://github.com/0xfnzero/sol-trade-sdk/tree/main/examples/shared_infrastructure/src/main.rs) |
 | PumpFun token sniping trading | `cargo run --package pumpfun_sniper_trading` | [examples/pumpfun_sniper_trading](https://github.com/0xfnzero/sol-trade-sdk/tree/main/examples/pumpfun_sniper_trading/src/main.rs) |
 | PumpFun token copy trading | `cargo run --package pumpfun_copy_trading` | [examples/pumpfun_copy_trading](https://github.com/0xfnzero/sol-trade-sdk/tree/main/examples/pumpfun_copy_trading/src/main.rs) |
 | PumpSwap trading operations | `cargo run --package pumpswap_trading` | [examples/pumpswap_trading](https://github.com/0xfnzero/sol-trade-sdk/tree/main/examples/pumpswap_trading/src/main.rs) |
@@ -207,16 +232,16 @@ Please ensure that the parameters your trading logic depends on are available in
 | Seed trading example | `cargo run --package seed_trading` | [examples/seed_trading](https://github.com/0xfnzero/sol-trade-sdk/tree/main/examples/seed_trading/src/main.rs) |
 | Gas fee strategy example | `cargo run --package gas_fee_strategy` | [examples/gas_fee_strategy](https://github.com/0xfnzero/sol-trade-sdk/tree/main/examples/gas_fee_strategy/src/main.rs) |
 
-### ⚙️ SWQOS Service Configuration
+### ⚙️ SWQoS Service Configuration
 
-When configuring SWQOS services, note the different parameter requirements for each service:
+When configuring SWQoS services, note the different parameter requirements for each service:
 
 - **Jito**: The first parameter is UUID (if no UUID, pass an empty string `""`)
 - **Other MEV services**: The first parameter is the API Token
 
 #### Custom URL Support
 
-Each SWQOS service now supports an optional custom URL parameter:
+Each SWQoS service now supports an optional custom URL parameter:
 
 ```rust
 // Using custom URL (third parameter)
@@ -227,7 +252,7 @@ let jito_config = SwqosConfig::Jito(
 );
 
 // Using default regional endpoint (third parameter is None)
-let nextblock_config = SwqosConfig::NextBlock(
+let bloxroute_config = SwqosConfig::Bloxroute(
     "your_api_token".to_string(),
     SwqosRegion::NewYork, // Will use the default endpoint for this region
     None // No custom URL, uses SwqosRegion
@@ -240,6 +265,29 @@ let nextblock_config = SwqosConfig::NextBlock(
 - This allows for maximum flexibility while maintaining backward compatibility 
 
 When using multiple MEV services, you need to use `Durable Nonce`. You need to use the `fetch_nonce_info` function to get the latest `nonce` value, and use it as the `durable_nonce` when trading.
+
+#### Astralane QUIC (Low-Latency)
+
+Astralane supports both HTTP and **QUIC** transport. QUIC reduces connection overhead and can lower submission latency. To use the QUIC channel, pass `Some(SwqosTransport::Quic)` as the fourth parameter of `SwqosConfig::Astralane`. Astralane’s QUIC service uses a **single endpoint** (no per-region endpoints); the SDK ignores the `region` (and optional custom URL) when QUIC is selected. You can pass the same region as your other SWQoS configs for consistency.
+
+```rust
+use sol_trade_sdk::{SwqosConfig, SwqosRegion, SwqosTransport};
+
+// Astralane over QUIC (low-latency); region is ignored (single QUIC endpoint)
+let swqos_configs: Vec<SwqosConfig> = vec![
+    SwqosConfig::Default(rpc_url.clone()),
+    SwqosConfig::Astralane(
+        "your_astralane_api_key".to_string(),
+        SwqosRegion::Frankfurt,  // same as other services; ignored for QUIC
+        None,
+        Some(SwqosTransport::Quic),
+    ),
+];
+// Then create TradeConfig / TradingClient as usual with swqos_configs
+```
+
+- **HTTP** (default): use `None` or `Some(SwqosTransport::Http)`; region and optional custom URL apply.
+- **QUIC**: use `Some(SwqosTransport::Quic)`; the SDK uses a single QUIC endpoint and ignores region. Same API key as HTTP.
 
 ---
 
@@ -262,19 +310,47 @@ Address Lookup Tables (ALT) allow you to optimize transaction size and reduce fe
 
 Use Durable Nonce to implement transaction replay protection and optimize transaction processing. For detailed information, see the [Durable Nonce Guide](docs/NONCE_CACHE.md).
 
+## 💰 Cashback Support (PumpFun / PumpSwap)
+
+PumpFun and PumpSwap support **cashback** for eligible tokens: part of the trading fee can be returned to the user. The SDK **must know** whether the token has cashback enabled so that buy/sell instructions include the correct accounts (e.g. `UserVolumeAccumulator` as remaining account for cashback coins).
+
+- **When params come from RPC**: If you use `PumpFunParams::from_mint_by_rpc` or `PumpSwapParams::from_pool_address_by_rpc` / `from_mint_by_rpc`, the SDK reads `is_cashback_coin` from chain—no extra step.
+- **When params come from event/parser**: If you build params from trade events (e.g. [sol-parser-sdk](https://github.com/0xfnzero/sol-parser-sdk)), you **must** pass the cashback flag into the SDK:
+  - **PumpFun**: `PumpFunParams::from_trade(..., is_cashback_coin)` and `PumpFunParams::from_dev_trade(..., is_cashback_coin)` take an `is_cashback_coin` parameter. Set it from the parsed event (e.g. CreateEvent’s `is_cashback_enabled` or BondingCurve’s `is_cashback_coin`).
+  - **PumpSwap**: `PumpSwapParams` has a field `is_cashback_coin`. When constructing params manually (e.g. from pool/trade events), set it from the parsed pool or event data.
+- The **pumpfun_copy_trading** and **pumpfun_sniper_trading** examples use sol-parser-sdk for gRPC subscription and pass `e.is_cashback_coin` when building params.
+- **Claim**: Use `client.claim_cashback_pumpfun()` and `client.claim_cashback_pumpswap(...)` to claim accumulated cashback.
+
+#### PumpFun: Creator Rewards Sharing (creator_vault)
+
+Some PumpFun coins use **Creator Rewards Sharing**, so the on-chain `creator_vault` can differ from the default derivation. If you reuse cached params from a **buy** when **selling**, you may see program error **2006 (seeds constraint violated)**. To avoid this:
+
+- **From gRPC/events (no RPC needed)**: You can get both `creator` and `creator_vault` from parsed transaction events:
+  - **sol-parser-sdk**: Before pushing events, the pipeline calls `fill_trade_accounts`, which fills `creator_vault` from the buy/sell instruction accounts (buy index 9, sell index 8). `creator` comes from the TradeEvent log. Use `PumpFunParams::from_trade(..., e.creator, e.creator_vault, ...)` or `from_dev_trade(..., e.creator, e.creator_vault, ...)` with the event `e`.
+  - **solana-streamer**: Instruction parsers set `creator_vault` from accounts[9] (buy) or accounts[8] (sell); `creator` comes from the merged CPI TradeEvent log. Use the same `from_trade` / `from_dev_trade` with `e.creator` and `e.creator_vault`.
+- **Override after RPC**: If you get params via `PumpFunParams::from_mint_by_rpc` but later receive a newer `creator_vault` from gRPC, call `.with_creator_vault(latest_creator_vault)` on the params before selling.
+
+The SDK does not fetch creator_vault from RPC on every sell (to avoid latency); pass the up-to-date vault from gRPC/events when available.
+
+#### PumpSwap: coin_creator_vault from events (no RPC)
+
+For **PumpSwap** (Pump AMM), `coin_creator_vault_ata` and `coin_creator_vault_authority` are required in buy/sell instructions. Both are available from parsed events without RPC:
+
+- **sol-parser-sdk**: Instruction parser sets them from accounts 17 and 18; the account filler also fills them when the event comes from logs. Use `PumpSwapParams::from_trade(..., e.coin_creator_vault_ata, e.coin_creator_vault_authority, ...)` with the buy/sell event `e`.
+- **solana-streamer**: Instruction parser sets them from `accounts.get(17)` and `accounts.get(18)`. Use the same `from_trade` with the event’s `coin_creator_vault_ata` and `coin_creator_vault_authority`.
+
 ## 🛡️ MEV Protection Services
 
 You can apply for a key through the official website: [Community Website](https://fnzero.dev/swqos)
 
 - **Jito**: High-performance block space
-- **NextBlock**: Fast transaction execution
 - **ZeroSlot**: Zero-latency transactions
 - **Temporal**: Time-sensitive transactions
 - **Bloxroute**: Blockchain network acceleration
-- **FlashBlock**: High-speed transaction execution with API key authentication - [Official Documentation](https://doc.flashblock.trade/)
-- **BlockRazor**: High-speed transaction execution with API key authentication - [Official Documentation](https://blockrazor.gitbook.io/blockrazor/)
-- **Node1**: High-speed transaction execution with API key authentication - [Official Documentation](https://node1.me/docs.html) 
-- **Astralane**: Blockchain network acceleration
+- **FlashBlock**: High-speed transaction execution with API key authentication
+- **BlockRazor**: High-speed transaction execution with API key authentication
+- **Node1**: High-speed transaction execution with API key authentication 
+- **Astralane**: Blockchain network acceleration (supports HTTP and QUIC; see [Astralane QUIC](#astralane-quic-low-latency) above)
 
 ## 📁 Project Structure
 
@@ -306,6 +382,10 @@ MIT License
 - Project Repository: https://github.com/0xfnzero/sol-trade-sdk
 - Telegram Group: https://t.me/fnzero_group
 - Discord: https://discord.gg/vuazbGkqQE
+
+## ⏱️ Timing metrics (v3.5.0+)
+
+When `log_enabled` and SDK log are on, the executor prints `[SDK] Buy/Sell timing(...)`. **Semantics changed in v3.5.0**: `submit` is now only the send to SWQOS/RPC; `confirm` is separate; `start_to_submit` (when `grpc_recv_us` is set) is **end-to-end from gRPC event to submit**, so it is larger than in-process timings. See [docs/TIMING_METRICS.md](docs/TIMING_METRICS.md) for definitions and how to compare with older versions.
 
 ## ⚠️ Important Notes
 

@@ -1,7 +1,7 @@
 use sol_trade_sdk::{
     SolanaTrade, TradeTokenType, common::{
         AnyResult, TradeConfig, fast_fn::get_associated_token_address_with_program_id_fast_use_seed
-    }, swqos::SwqosConfig, trading::{core::params::PumpSwapParams, factory::DexType}
+    }, swqos::SwqosConfig, trading::{core::params::{PumpSwapParams, DexParamEnum}, factory::DexType}
 };
 use solana_commitment_config::CommitmentConfig;
 use solana_sdk::signature::Keypair;
@@ -14,12 +14,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let client = create_solana_trade_client().await?;
     let slippage_basis_points = Some(100);
-    let recent_blockhash = client.rpc.get_latest_blockhash().await?;
+    let recent_blockhash = client.infrastructure.rpc.get_latest_blockhash().await?;
     let pool = Pubkey::from_str("539m4mVWt6iduB6W8rDGPMarzNCMesuqY5eUTiiYHAgR").unwrap();
     let mint_pubkey = Pubkey::from_str("pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn").unwrap();
 
     let gas_fee_strategy = sol_trade_sdk::common::GasFeeStrategy::new();
-    gas_fee_strategy.set_global_fee_strategy(150000,150000, 500000,500000, 0.001, 0.001, 256 * 1024, 0);
+    gas_fee_strategy.set_global_fee_strategy(150000, 150000, 500000, 500000, 0.001, 0.001);
 
     // Buy tokens
     println!("Buying tokens from PumpSwap...");
@@ -31,8 +31,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         input_token_amount: buy_sol_amount,
         slippage_basis_points: slippage_basis_points,
         recent_blockhash: Some(recent_blockhash),
-        extension_params: Box::new(
-            PumpSwapParams::from_pool_address_by_rpc(&client.rpc, &pool).await?,
+        extension_params: DexParamEnum::PumpSwap(
+            PumpSwapParams::from_pool_address_by_rpc(&client.infrastructure.rpc, &pool).await?,
         ),
         address_lookup_table_account: None,
         wait_transaction_confirmed: true,
@@ -43,13 +43,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fixed_output_token_amount: None,
         gas_fee_strategy: gas_fee_strategy.clone(),
         simulate: false,
+        use_exact_sol_amount: None,
+        grpc_recv_us: None,
     };
     client.buy(buy_params).await?;
 
     // Sell tokens
     println!("Selling tokens from PumpSwap...");
 
-    let rpc = client.rpc.clone();
+    let rpc = client.infrastructure.rpc.clone();
     let payer = client.payer.pubkey();
     let program_id = sol_trade_sdk::constants::TOKEN_PROGRAM_2022;
     let account = get_associated_token_address_with_program_id_fast_use_seed(&payer, &mint_pubkey, &program_id, client.use_seed_optimize);
@@ -63,14 +65,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         slippage_basis_points: slippage_basis_points,
         recent_blockhash: Some(recent_blockhash),
         with_tip: false,
-        extension_params: Box::new(
-            PumpSwapParams::from_pool_address_by_rpc(&client.rpc, &pool).await?,
+        extension_params: DexParamEnum::PumpSwap(
+            PumpSwapParams::from_pool_address_by_rpc(&client.infrastructure.rpc, &pool).await?,
         ),
         address_lookup_table_account: None,
         wait_transaction_confirmed: true,
         create_output_token_ata: true,
         close_output_token_ata: true,
         close_mint_token_ata: false,
+        grpc_recv_us: None,
         durable_nonce: None,
         fixed_output_token_amount: None,
         gas_fee_strategy: gas_fee_strategy,

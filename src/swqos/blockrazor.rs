@@ -1,7 +1,6 @@
-use crate::swqos::common::{poll_transaction_confirmation, serialize_transaction_and_encode};
+use crate::swqos::common::{default_http_client_builder, poll_transaction_confirmation, serialize_transaction_and_encode};
 use rand::seq::IndexedRandom;
-use reqwest::{Client, header::{HeaderMap, HeaderValue, CONTENT_TYPE}};
-use serde_json::json;
+use reqwest::Client;
 use std::{sync::Arc, time::Instant};
 
 use std::time::Duration;
@@ -29,12 +28,12 @@ pub struct BlockRazorClient {
 
 #[async_trait::async_trait]
 impl SwqosClientTrait for BlockRazorClient {
-    async fn send_transaction(&self, trade_type: TradeType, transaction: &VersionedTransaction) -> Result<()> {
-        self.send_transaction(trade_type, transaction).await
+    async fn send_transaction(&self, trade_type: TradeType, transaction: &VersionedTransaction, wait_confirmation: bool) -> Result<()> {
+        self.send_transaction(trade_type, transaction, wait_confirmation).await
     }
 
-    async fn send_transactions(&self, trade_type: TradeType, transactions: &Vec<VersionedTransaction>) -> Result<()> {
-        self.send_transactions(trade_type, transactions).await
+    async fn send_transactions(&self, trade_type: TradeType, transactions: &Vec<VersionedTransaction>, wait_confirmation: bool) -> Result<()> {
+        self.send_transactions(trade_type, transactions, wait_confirmation).await
     }
 
     fn get_tip_account(&self) -> Result<String> {
@@ -50,17 +49,9 @@ impl SwqosClientTrait for BlockRazorClient {
 impl BlockRazorClient {
     pub fn new(rpc_url: String, endpoint: String, auth_token: String) -> Self {
         let rpc_client = SolanaRpcClient::new(rpc_url);
-        let http_client = Client::builder()
-            // Optimized connection pool settings for high performance
-            .pool_idle_timeout(Duration::from_secs(120))
-            .pool_max_idle_per_host(256)  // Increased from 64 to 256
-            .tcp_keepalive(Some(Duration::from_secs(60)))  // Reduced from 1200 to 60
-            .tcp_nodelay(true)  // Disable Nagle's algorithm for lower latency
-            .http2_keep_alive_interval(Duration::from_secs(10))
-            .http2_keep_alive_timeout(Duration::from_secs(5))
-            .http2_adaptive_window(true)  // Enable adaptive flow control
-            .timeout(Duration::from_millis(3000))  // Reduced from 10s to 3s
-            .connect_timeout(Duration::from_millis(2000))  // Reduced from 5s to 2s
+        // 官方文档：請求中唯一允許的 header 是 Content-Type: text/plain；避免默认 User-Agent 等导致 500
+        let http_client = default_http_client_builder()
+            .user_agent("")
             .build()
             .unwrap();
         
@@ -90,18 +81,22 @@ impl BlockRazorClient {
         let stop_ping = self.stop_ping.clone();
         
         let handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(60)); // Ping every 60 seconds
-            
+            // Immediate first ping to warm connection and reduce first-submit cold start latency
+            if let Err(e) = Self::send_ping_request(&http_client, &endpoint, &auth_token).await {
+                if crate::common::sdk_log::sdk_log_enabled() {
+                    eprintln!("BlockRazor ping request failed: {}", e);
+                }
+            }
+            let mut interval = tokio::time::interval(Duration::from_secs(30));  // 30s keepalive to avoid server ~5min idle close
             loop {
                 interval.tick().await;
-                
                 if stop_ping.load(Ordering::Relaxed) {
                     break;
                 }
-                
-                // Send ping request
                 if let Err(e) = Self::send_ping_request(&http_client, &endpoint, &auth_token).await {
-                    eprintln!("BlockRazor ping request failed: {}", e);
+                    if crate::common::sdk_log::sdk_log_enabled() {
+                        eprintln!("BlockRazor ping request failed: {}", e);
+                    }
                 }
             }
         });
@@ -116,92 +111,79 @@ impl BlockRazorClient {
         }
     }
 
-    /// Send ping request to /health endpoint
+    /// Send ping request: POST /v2/health?auth=... (Keep Alive). Only required param: auth.
     async fn send_ping_request(http_client: &Client, endpoint: &str, auth_token: &str) -> Result<()> {
-        // Build health URL by replacing sendTransaction with health
-        let ping_url = if endpoint.ends_with("sendTransaction") {
-            endpoint.replace("sendTransaction", "health")
-        } else if endpoint.ends_with("/sendTransaction") {
-            endpoint.replace("/sendTransaction", "/health")
-        } else {
-            // Fallback to original logic if endpoint doesn't end with sendTransaction
-            if endpoint.ends_with('/') {
-                format!("{}health", endpoint)
-            } else {
-                format!("{}/health", endpoint)
-            }
-        };
-
-        // Prepare headers
-        let mut headers = HeaderMap::new();
-        headers.insert("apikey", HeaderValue::from_str(auth_token)?);
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-
-        // Send GET request to /health endpoint with headers
-        let response = http_client.get(&ping_url)
-            .headers(headers)
+        let ping_url = endpoint.replace("/v2/sendTransaction", "/v2/health");
+        let response = http_client
+            .post(&ping_url)
+            .query(&[("auth", auth_token)])
+            .header("Content-Type", "text/plain")
+            .timeout(Duration::from_millis(1500))
+            .body(&[] as &[u8])
             .send()
             .await?;
-        
-        if response.status().is_success() {
-            // ping successful, connection remains active
-            // Can optionally log, but to reduce noise, not printing here
-        } else {
-            eprintln!("BlockRazor ping request failed with status: {}", response.status());
+        let status = response.status();
+        let _ = response.bytes().await;
+        if !status.is_success() {
+            eprintln!("BlockRazor ping request failed with status: {}", status);
         }
-        
         Ok(())
     }
 
-    pub async fn send_transaction(&self, trade_type: TradeType, transaction: &VersionedTransaction) -> Result<()> {
+    /// Send transaction via v2 API: plain Base64 body, Content-Type: text/plain. Only required URI param: auth.
+    /// 文档要求：auth 以 URI 参数传入；body 为纯 Base64 编码交易；唯一允许的 header 为 Content-Type: text/plain。
+    pub async fn send_transaction(&self, trade_type: TradeType, transaction: &VersionedTransaction, wait_confirmation: bool) -> Result<()> {
         let start_time = Instant::now();
-        let (content, signature) = serialize_transaction_and_encode(transaction, UiTransactionEncoding::Base64).await?;
+        let (content, signature) = serialize_transaction_and_encode(transaction, UiTransactionEncoding::Base64)?;
 
-        // BlockRazor使用fast模式的请求格式
-        let request_body = serde_json::to_string(&json!({
-            "transaction": content,
-            "mode": "fast"
-        }))?;
-
-        // BlockRazor使用apikey header
-        let response_text = self.http_client.post(&self.endpoint)
-            .body(request_body)
-            .header("Content-Type", "application/json")
-            .header("apikey", &self.auth_token)
+        let response = self.http_client
+            .post(&self.endpoint)
+            .query(&[("auth", self.auth_token.as_str())])
+            .header("Content-Type", "text/plain")
+            .body(content)
             .send()
-            .await?
-            .text()
             .await?;
 
-        // Parse JSON response
-        if let Ok(response_json) = serde_json::from_str::<serde_json::Value>(&response_text) {
-            if response_json.get("result").is_some() || response_json.get("signature").is_some() {
+        let status = response.status();
+        if status.is_success() {
+            let _ = response.bytes().await;
+            if crate::common::sdk_log::sdk_log_enabled() {
                 println!(" [blockrazor] {} submitted: {:?}", trade_type, start_time.elapsed());
-            } else if let Some(_error) = response_json.get("error") {
-                eprintln!(" [blockrazor] {} submission failed: {:?}", trade_type, _error);
             }
         } else {
-            eprintln!(" [blockrazor] {} submission failed: {:?}", trade_type, response_text);
+            let body = response.text().await.unwrap_or_default();
+            if crate::common::sdk_log::sdk_log_enabled() {
+                eprintln!(" [blockrazor] {} submission failed: status {} body: {}", trade_type, status, body);
+            }
+            return Err(anyhow::anyhow!(
+                "BlockRazor sendTransaction failed: status {} body: {}",
+                status,
+                body
+            ));
         }
 
-        let start_time: Instant = Instant::now();
-        match poll_transaction_confirmation(&self.rpc_client, signature).await {
+        let start_time = Instant::now();
+        match poll_transaction_confirmation(&self.rpc_client, signature, wait_confirmation).await {
             Ok(_) => (),
             Err(e) => {
-                println!(" signature: {:?}", signature);
-                println!(" [blockrazor] {} confirmation failed: {:?}", trade_type, start_time.elapsed());
+                if crate::common::sdk_log::sdk_log_enabled() {
+                    println!(" signature: {:?}", signature);
+                    println!(" [blockrazor] {} confirmation failed: {:?}", trade_type, start_time.elapsed());
+                }
                 return Err(e);
             },
         }
-        println!(" signature: {:?}", signature);
-        println!(" [blockrazor] {} confirmed: {:?}", trade_type, start_time.elapsed());
+        if wait_confirmation && crate::common::sdk_log::sdk_log_enabled() {
+            println!(" signature: {:?}", signature);
+            println!(" [blockrazor] {} confirmed: {:?}", trade_type, start_time.elapsed());
+        }
 
         Ok(())
     }
 
-    pub async fn send_transactions(&self, trade_type: TradeType, transactions: &Vec<VersionedTransaction>) -> Result<()> {
+    pub async fn send_transactions(&self, trade_type: TradeType, transactions: &Vec<VersionedTransaction>, wait_confirmation: bool) -> Result<()> {
         for transaction in transactions {
-            self.send_transaction(trade_type, transaction).await?;
+            self.send_transaction(trade_type, transaction, wait_confirmation).await?;
         }
         Ok(())
     }

@@ -1,7 +1,7 @@
 use sol_trade_sdk::common::spl_associated_token_account::get_associated_token_address;
 use sol_trade_sdk::common::TradeConfig;
 use sol_trade_sdk::constants::{WSOL_TOKEN_ACCOUNT, USDC_TOKEN_ACCOUNT};
-use sol_trade_sdk::trading::core::params::RaydiumCpmmParams;
+use sol_trade_sdk::trading::core::params::{RaydiumCpmmParams, DexParamEnum};
 use sol_trade_sdk::trading::factory::DexType;
 use sol_trade_sdk::TradeTokenType;
 use sol_trade_sdk::{common::AnyResult, swqos::SwqosConfig, SolanaTrade};
@@ -127,13 +127,13 @@ async fn raydium_cpmm_copy_trade_with_grpc(trade_info: RaydiumCpmmSwapEvent) -> 
         trade_info.input_token_mint
     };
     let slippage_basis_points = Some(100);
-    let recent_blockhash = client.rpc.get_latest_blockhash().await?;
+    let recent_blockhash = client.infrastructure.rpc.get_latest_blockhash().await?;
 
     let gas_fee_strategy = sol_trade_sdk::common::GasFeeStrategy::new();
-    gas_fee_strategy.set_global_fee_strategy(150000,150000, 500000,500000, 0.001, 0.001, 256 * 1024, 0);
+    gas_fee_strategy.set_global_fee_strategy(150000, 150000, 500000, 500000, 0.001, 0.001);
 
     let buy_params =
-        RaydiumCpmmParams::from_pool_address_by_rpc(&client.rpc, &trade_info.pool_state).await?;
+        RaydiumCpmmParams::from_pool_address_by_rpc(&client.infrastructure.rpc, &trade_info.pool_state).await?;
     
     let is_wsol = trade_info.input_token_mint == sol_trade_sdk::constants::WSOL_TOKEN_ACCOUNT
         || trade_info.output_token_mint == sol_trade_sdk::constants::WSOL_TOKEN_ACCOUNT;
@@ -148,7 +148,7 @@ async fn raydium_cpmm_copy_trade_with_grpc(trade_info: RaydiumCpmmSwapEvent) -> 
         input_token_amount: input_token_amount,
         slippage_basis_points: slippage_basis_points,
         recent_blockhash: Some(recent_blockhash),
-        extension_params: Box::new(buy_params),
+        extension_params: DexParamEnum::RaydiumCpmm(buy_params),
         address_lookup_table_account: None,
         wait_transaction_confirmed: true,
         create_input_token_ata: is_wsol,
@@ -158,13 +158,15 @@ async fn raydium_cpmm_copy_trade_with_grpc(trade_info: RaydiumCpmmSwapEvent) -> 
         fixed_output_token_amount: None,
         gas_fee_strategy: gas_fee_strategy.clone(),
         simulate: false,
+        use_exact_sol_amount: None,
+        grpc_recv_us: None,
     };
     client.buy(buy_params).await?;
 
     // Sell tokens
     println!("Selling tokens from Raydium_cpmm...");
 
-    let rpc = client.rpc.clone();
+    let rpc = client.infrastructure.rpc.clone();
     let payer = client.payer.pubkey();
     let account = get_associated_token_address(&payer, &mint_pubkey);
     let balance = rpc.get_token_account_balance(&account).await?;
@@ -172,7 +174,7 @@ async fn raydium_cpmm_copy_trade_with_grpc(trade_info: RaydiumCpmmSwapEvent) -> 
     let amount_token = balance.amount.parse::<u64>().unwrap();
 
     let sell_params =
-        RaydiumCpmmParams::from_pool_address_by_rpc(&client.rpc, &trade_info.pool_state).await?;
+        RaydiumCpmmParams::from_pool_address_by_rpc(&client.infrastructure.rpc, &trade_info.pool_state).await?;
 
     println!("Selling {} tokens", amount_token);
     let sell_params = sol_trade_sdk::TradeSellParams {
@@ -183,7 +185,7 @@ async fn raydium_cpmm_copy_trade_with_grpc(trade_info: RaydiumCpmmSwapEvent) -> 
         slippage_basis_points: slippage_basis_points,
         recent_blockhash: Some(recent_blockhash),
         with_tip: false,
-        extension_params: Box::new(sell_params),
+        extension_params: DexParamEnum::RaydiumCpmm(sell_params),
         address_lookup_table_account: None,
         wait_transaction_confirmed: true,
         create_output_token_ata: is_wsol,
@@ -193,6 +195,7 @@ async fn raydium_cpmm_copy_trade_with_grpc(trade_info: RaydiumCpmmSwapEvent) -> 
         fixed_output_token_amount: None,
         gas_fee_strategy: gas_fee_strategy,
         simulate: false,
+        grpc_recv_us: None,
     };
     client.sell(sell_params).await?;
 

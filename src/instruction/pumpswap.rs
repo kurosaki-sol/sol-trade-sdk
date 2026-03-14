@@ -1,7 +1,9 @@
 use crate::{
     constants::trade::trade::DEFAULT_SLIPPAGE,
     instruction::utils::pumpswap::{
-        accounts, fee_recipient_ata, get_user_volume_accumulator_pda, BUY_DISCRIMINATOR,
+        accounts, fee_recipient_ata, get_mayhem_fee_recipient_random, get_pool_v2_pda,
+        get_user_volume_accumulator_pda, get_user_volume_accumulator_quote_ata,
+        get_user_volume_accumulator_wsol_ata, BUY_DISCRIMINATOR, BUY_EXACT_QUOTE_IN_DISCRIMINATOR,
         SELL_DISCRIMINATOR,
     },
     trading::{
@@ -118,16 +120,18 @@ impl InstructionBuilder for PumpSwapInstructionBuilder {
                 params.open_seed_optimize,
             );
 
-        // Determine fee recipient based on mayhem mode
+        // Determine fee recipient based on mayhem mode (pump-public-docs: 10th = Mayhem fee recipient, 11th = WSOL ATA of Mayhem; use any one randomly)
         let is_mayhem_mode = protocol_params.is_mayhem_mode;
-        let fee_recipient =
-            if is_mayhem_mode { accounts::MAYHEM_FEE_RECIPIENT } else { accounts::FEE_RECIPIENT };
-        let fee_recipient_meta = if is_mayhem_mode {
-            accounts::MAYHEM_FEE_RECIPIENT_META
+        let (fee_recipient, fee_recipient_meta) = if is_mayhem_mode {
+            get_mayhem_fee_recipient_random()
         } else {
-            accounts::FEE_RECIPIENT_META
+            (accounts::FEE_RECIPIENT, accounts::FEE_RECIPIENT_META)
         };
-        let fee_recipient_ata = fee_recipient_ata(fee_recipient, quote_mint);
+        let fee_recipient_ata = if is_mayhem_mode {
+            fee_recipient_ata(fee_recipient, crate::constants::WSOL_TOKEN_ACCOUNT)
+        } else {
+            fee_recipient_ata(fee_recipient, quote_mint)
+        };
 
         // ========================================
         // Build instructions
@@ -176,37 +180,56 @@ impl InstructionBuilder for PumpSwapInstructionBuilder {
         ]);
         if quote_is_wsol_or_usdc {
             accounts.push(accounts::GLOBAL_VOLUME_ACCUMULATOR_META);
-            accounts.push(AccountMeta::new(
-                get_user_volume_accumulator_pda(&params.payer.pubkey()).unwrap(),
-                false,
-            ));
+            let uva = get_user_volume_accumulator_pda(&params.payer.pubkey())
+                .ok_or_else(|| anyhow!("user_volume_accumulator PDA derivation failed"))?;
+            accounts.push(AccountMeta::new(uva, false));
         }
         accounts.push(accounts::FEE_CONFIG_META);
         accounts.push(accounts::FEE_PROGRAM_META);
-
-        // Create instruction data
-        let mut data = [0u8; 24];
-        if quote_is_wsol_or_usdc {
-            data[..8].copy_from_slice(&BUY_DISCRIMINATOR);
-            // base_amount_out
-            data[8..16].copy_from_slice(&token_amount.to_le_bytes());
-            // max_quote_amount_in
-            data[16..24].copy_from_slice(&sol_amount.to_le_bytes());
-        } else {
-            data[..8].copy_from_slice(&SELL_DISCRIMINATOR);
-            // base_amount_in
-            data[8..16].copy_from_slice(&sol_amount.to_le_bytes());
-            // min_quote_amount_out
-            data[16..24].copy_from_slice(&token_amount.to_le_bytes());
+        // Cashback: remaining_accounts[0] = WSOL ATA of UserVolumeAccumulator (after named accounts per IDL)
+        if protocol_params.is_cashback_coin {
+            if let Some(wsol_ata) = get_user_volume_accumulator_wsol_ata(&params.payer.pubkey()) {
+                accounts.push(AccountMeta::new(wsol_ata, false));
+            }
         }
+        // remainingAccounts: @pump-fun/pump-swap-sdk 要求末尾传 poolV2Pda(baseMint)，勿删
+        let pool_v2 = get_pool_v2_pda(&base_mint)
+            .ok_or_else(|| anyhow!("pool_v2 PDA derivation failed for base_mint {}", base_mint))?;
+        accounts.push(AccountMeta::new_readonly(pool_v2, false));
 
-        let buy_instruction = Instruction {
-            program_id: accounts::AMM_PROGRAM,
-            accounts: accounts.clone(),
-            data: data.to_vec(),
+        // Create instruction data（buy/buy_exact_quote_in 第三参数 track_volume: OptionBool，仅代币支持返现时传 Some(true)；sell 仅两参数）
+        let track_volume = if protocol_params.is_cashback_coin { [1u8, 1u8] } else { [1u8, 0u8] }; // Some(true) / Some(false)
+        let data: Vec<u8> = if quote_is_wsol_or_usdc {
+            let mut buf = [0u8; 26];
+            if params.use_exact_sol_amount.unwrap_or(true) {
+                let min_base_amount_out = crate::utils::calc::common::calculate_with_slippage_sell(
+                    token_amount,
+                    params.slippage_basis_points.unwrap_or(DEFAULT_SLIPPAGE),
+                );
+                buf[..8].copy_from_slice(&BUY_EXACT_QUOTE_IN_DISCRIMINATOR);
+                buf[8..16].copy_from_slice(&params.input_amount.unwrap_or(0).to_le_bytes());
+                buf[16..24].copy_from_slice(&min_base_amount_out.to_le_bytes());
+                buf[24..26].copy_from_slice(&track_volume);
+            } else {
+                buf[..8].copy_from_slice(&BUY_DISCRIMINATOR);
+                buf[8..16].copy_from_slice(&token_amount.to_le_bytes());
+                buf[16..24].copy_from_slice(&sol_amount.to_le_bytes());
+                buf[24..26].copy_from_slice(&track_volume);
+            }
+            buf.to_vec()
+        } else {
+            let mut buf = [0u8; 24];
+            buf[..8].copy_from_slice(&SELL_DISCRIMINATOR);
+            buf[8..16].copy_from_slice(&sol_amount.to_le_bytes());
+            buf[16..24].copy_from_slice(&token_amount.to_le_bytes());
+            buf.to_vec()
         };
 
-        instructions.push(buy_instruction);
+        instructions.push(Instruction {
+            program_id: accounts::AMM_PROGRAM,
+            accounts,
+            data,
+        });
         if close_wsol_ata {
             // Close wSOL ATA account, reclaim rent
             instructions.extend(crate::trading::common::close_wsol(&params.payer.pubkey()));
@@ -292,16 +315,18 @@ impl InstructionBuilder for PumpSwapInstructionBuilder {
             sol_amount = params.fixed_output_amount.unwrap();
         }
 
-        // Determine fee recipient based on mayhem mode
+        // Determine fee recipient based on mayhem mode (pump-public-docs: 10th = Mayhem fee recipient, 11th = WSOL ATA of Mayhem; use any one randomly)
         let is_mayhem_mode = protocol_params.is_mayhem_mode;
-        let fee_recipient =
-            if is_mayhem_mode { accounts::MAYHEM_FEE_RECIPIENT } else { accounts::FEE_RECIPIENT };
-        let fee_recipient_meta = if is_mayhem_mode {
-            accounts::MAYHEM_FEE_RECIPIENT_META
+        let (fee_recipient, fee_recipient_meta) = if is_mayhem_mode {
+            get_mayhem_fee_recipient_random()
         } else {
-            accounts::FEE_RECIPIENT_META
+            (accounts::FEE_RECIPIENT, accounts::FEE_RECIPIENT_META)
         };
-        let fee_recipient_ata = fee_recipient_ata(fee_recipient, quote_mint);
+        let fee_recipient_ata = if is_mayhem_mode {
+            fee_recipient_ata(fee_recipient, crate::constants::WSOL_TOKEN_ACCOUNT)
+        } else {
+            fee_recipient_ata(fee_recipient, quote_mint)
+        };
 
         let user_base_token_account =
             crate::common::fast_fn::get_associated_token_address_with_program_id_fast_use_seed(
@@ -352,14 +377,30 @@ impl InstructionBuilder for PumpSwapInstructionBuilder {
         ]);
         if !quote_is_wsol_or_usdc {
             accounts.push(accounts::GLOBAL_VOLUME_ACCUMULATOR_META);
-            accounts.push(AccountMeta::new(
-                get_user_volume_accumulator_pda(&params.payer.pubkey()).unwrap(),
-                false,
-            ));
+            let uva = get_user_volume_accumulator_pda(&params.payer.pubkey())
+                .ok_or_else(|| anyhow!("user_volume_accumulator PDA derivation failed"))?;
+            accounts.push(AccountMeta::new(uva, false));
         }
-
         accounts.push(accounts::FEE_CONFIG_META);
         accounts.push(accounts::FEE_PROGRAM_META);
+        // Cashback sell: 官方 remainingAccounts = [accumulator 的 quote_mint ATA, accumulator PDA, poolV2]（用 quote_mint 非固定 WSOL）
+        if protocol_params.is_cashback_coin {
+            if let (Some(quote_ata), Some(accumulator)) = (
+                get_user_volume_accumulator_quote_ata(
+                    &params.payer.pubkey(),
+                    &quote_mint,
+                    &quote_token_program,
+                ),
+                get_user_volume_accumulator_pda(&params.payer.pubkey()),
+            ) {
+                accounts.push(AccountMeta::new(quote_ata, false));
+                accounts.push(AccountMeta::new(accumulator, false));
+            }
+        }
+        // remainingAccounts: @pump-fun/pump-swap-sdk sell 要求末尾传 poolV2Pda(baseMint)，勿删
+        let pool_v2 = get_pool_v2_pda(&base_mint)
+            .ok_or_else(|| anyhow!("pool_v2 PDA derivation failed for base_mint {}", base_mint))?;
+        accounts.push(AccountMeta::new_readonly(pool_v2, false));
 
         // Create instruction data
         let mut data = [0u8; 24];
@@ -377,13 +418,11 @@ impl InstructionBuilder for PumpSwapInstructionBuilder {
             data[16..24].copy_from_slice(&token_amount.to_le_bytes());
         }
 
-        let sell_instruction = Instruction {
+        instructions.push(Instruction {
             program_id: accounts::AMM_PROGRAM,
-            accounts: accounts.clone(),
+            accounts,
             data: data.to_vec(),
-        };
-
-        instructions.push(sell_instruction);
+        });
 
         if close_wsol_ata {
             instructions.extend(crate::trading::common::close_wsol(&params.payer.pubkey()));
@@ -403,4 +442,39 @@ impl InstructionBuilder for PumpSwapInstructionBuilder {
         }
         Ok(instructions)
     }
+}
+
+/// Claim cashback for PumpSwap (AMM). Transfers WSOL from UserVolumeAccumulator's WSOL ATA to user's WSOL ATA.
+/// Caller should ensure user's WSOL ATA exists (e.g. create idempotent ATA instruction) before this instruction.
+pub fn claim_cashback_pumpswap_instruction(
+    payer: &Pubkey,
+    quote_mint: Pubkey,
+    quote_token_program: Pubkey,
+) -> Option<solana_sdk::instruction::Instruction> {
+    const CLAIM_CASHBACK_DISCRIMINATOR: [u8; 8] = [37, 58, 35, 126, 190, 53, 228, 197];
+    let user_volume_accumulator = get_user_volume_accumulator_pda(payer)?;
+    let user_volume_accumulator_wsol_ata = get_user_volume_accumulator_wsol_ata(payer)?;
+    let user_wsol_ata = crate::common::fast_fn::get_associated_token_address_with_program_id_fast(
+        payer,
+        &quote_mint,
+        &quote_token_program,
+    );
+    // IDL order: user, user_volume_accumulator, quote_mint, quote_token_program,
+    // user_volume_accumulator_wsol_token_account, user_wsol_token_account, system_program, event_authority, program
+    let accounts = vec![
+        AccountMeta::new(*payer, true),                              // user (signer, writable)
+        AccountMeta::new(user_volume_accumulator, false),            // user_volume_accumulator (writable)
+        AccountMeta::new_readonly(quote_mint, false),
+        AccountMeta::new_readonly(quote_token_program, false),
+        AccountMeta::new(user_volume_accumulator_wsol_ata, false),   // writable
+        AccountMeta::new(user_wsol_ata, false),                      // writable
+        crate::constants::SYSTEM_PROGRAM_META,
+        accounts::EVENT_AUTHORITY_META,
+        accounts::AMM_PROGRAM_META,
+    ];
+    Some(solana_sdk::instruction::Instruction::new_with_bytes(
+        accounts::AMM_PROGRAM,
+        &CLAIM_CASHBACK_DISCRIMINATOR,
+        accounts,
+    ))
 }

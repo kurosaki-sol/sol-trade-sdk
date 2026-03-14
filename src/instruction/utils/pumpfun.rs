@@ -1,12 +1,15 @@
 use crate::common::{bonding_curve::BondingCurveAccount, SolanaRpcClient};
 use anyhow::anyhow;
-use solana_sdk::pubkey::Pubkey;
+use rand::seq::IndexedRandom;
+use solana_sdk::{instruction::AccountMeta, pubkey::Pubkey};
 use std::sync::Arc;
 
 /// Constants used as seeds for deriving PDAs (Program Derived Addresses)
 pub mod seeds {
     /// Seed for bonding curve PDAs
     pub const BONDING_CURVE_SEED: &[u8] = b"bonding-curve";
+    /// Seed for bonding curve v2 PDA (required by program upgrade, readonly at end of account list)
+    pub const BONDING_CURVE_V2_SEED: &[u8] = b"bonding-curve-v2";
 
     /// Seed for creator vault PDAs
     pub const CREATOR_VAULT_SEED: &[u8] = b"creator-vault";
@@ -57,8 +60,18 @@ pub mod global_constants {
             is_writable: true,
         };
 
-    pub const MAYHEM_FEE_RECIPIENT: Pubkey =
-        pubkey!("GesfTA3X2arioaHp8bbKdjG9vJtskViWACZoYvxp4twS");
+    /// Mayhem fee recipients (pump-public-docs: use any one randomly)
+    pub const MAYHEM_FEE_RECIPIENTS: [Pubkey; 8] = [
+        pubkey!("GesfTA3X2arioaHp8bbKdjG9vJtskViWACZoYvxp4twS"),
+        pubkey!("4budycTjhs9fD6xw62VBducVTNgMgJJ5BgtKq7mAZwn6"),
+        pubkey!("8SBKzEQU4nLSzcwF4a74F2iaUDQyTfjGndn6qUWBnrpR"),
+        pubkey!("4UQeTP1T39KZ9Sfxzo3WR5skgsaP6NZa87BAkuazLEKH"),
+        pubkey!("8sNeir4QsLsJdYpc9RZacohhK1Y5FLU3nC5LXgYB4aa6"),
+        pubkey!("Fh9HmeLNUMVCvejxCtCL2DbYaRyBFVJ5xrWkLnMH6fdk"),
+        pubkey!("463MEnMeGyJekNZFQSTUABBEbLnvMTALbT6ZmsxAbAdq"),
+        pubkey!("6AUH3WEHucYZyC61hqpqYUWVto5qA5hjHuNQ32GNnNxA"),
+    ];
+    pub const MAYHEM_FEE_RECIPIENT: Pubkey = MAYHEM_FEE_RECIPIENTS[0];
     pub const MAYHEM_FEE_RECIPIENT_META: solana_sdk::instruction::AccountMeta =
         solana_sdk::instruction::AccountMeta {
             pubkey: MAYHEM_FEE_RECIPIENT,
@@ -154,6 +167,24 @@ pub mod accounts {
         };
 }
 
+/// Instruction discriminators for PumpFun program
+pub const BUY_DISCRIMINATOR: [u8; 8] = [102, 6, 61, 18, 1, 218, 235, 234];
+pub const BUY_EXACT_SOL_IN_DISCRIMINATOR: [u8; 8] = [56, 252, 116, 8, 158, 223, 205, 95];
+pub const SELL_DISCRIMINATOR: [u8; 8] = [51, 230, 133, 164, 1, 127, 131, 173];
+
+/// Returns a random Mayhem fee recipient AccountMeta (pump-public-docs: Bonding Curve 2nd account = Mayhem fee recipient; use any one randomly).
+#[inline]
+pub fn get_mayhem_fee_recipient_meta_random() -> AccountMeta {
+    let recipient = *global_constants::MAYHEM_FEE_RECIPIENTS
+        .choose(&mut rand::rng())
+        .unwrap_or(&global_constants::MAYHEM_FEE_RECIPIENTS[0]);
+    AccountMeta {
+        pubkey: recipient,
+        is_signer: false,
+        is_writable: true,
+    }
+}
+
 pub struct Symbol;
 
 impl Symbol {
@@ -173,6 +204,20 @@ pub fn get_bonding_curve_pda(mint: &Pubkey) -> Option<Pubkey> {
     )
 }
 
+/// Bonding curve v2 PDA (seeds: ["bonding-curve-v2", mint]). Required at end of buy/sell/buy_exact_sol_in accounts.
+#[inline]
+pub fn get_bonding_curve_v2_pda(mint: &Pubkey) -> Option<Pubkey> {
+    crate::common::fast_fn::get_cached_pda(
+        crate::common::fast_fn::PdaCacheKey::PumpFunBondingCurveV2(*mint),
+        || {
+            let seeds: &[&[u8]; 2] = &[seeds::BONDING_CURVE_V2_SEED, mint.as_ref()];
+            let program_id: &Pubkey = &accounts::PUMPFUN;
+            let pda: Option<(Pubkey, u8)> = Pubkey::try_find_program_address(seeds, program_id);
+            pda.map(|pubkey| pubkey.0)
+        },
+    )
+}
+
 #[inline]
 pub fn get_creator(creator_vault_pda: &Pubkey) -> Pubkey {
     if creator_vault_pda.eq(&Pubkey::default()) {
@@ -181,10 +226,9 @@ pub fn get_creator(creator_vault_pda: &Pubkey) -> Pubkey {
         // Fast check against cached default creator vault
         static DEFAULT_CREATOR_VAULT: std::sync::LazyLock<Option<Pubkey>> =
             std::sync::LazyLock::new(|| get_creator_vault_pda(&Pubkey::default()));
-        if creator_vault_pda.eq(&DEFAULT_CREATOR_VAULT.unwrap()) {
-            Pubkey::default()
-        } else {
-            *creator_vault_pda
+        match DEFAULT_CREATOR_VAULT.as_ref() {
+            Some(default) if creator_vault_pda.eq(default) => Pubkey::default(),
+            _ => *creator_vault_pda,
         }
     }
 }
@@ -253,4 +297,33 @@ pub fn get_buy_price(
     let s_u64 = s as u64;
 
     s_u64.min(real_token_reserves)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use solana_sdk::pubkey::Pubkey;
+
+    #[test]
+    fn pumpfun_discriminators_are_8_bytes() {
+        assert_eq!(BUY_DISCRIMINATOR.len(), 8);
+        assert_eq!(BUY_EXACT_SOL_IN_DISCRIMINATOR.len(), 8);
+        assert_eq!(SELL_DISCRIMINATOR.len(), 8);
+    }
+
+    #[test]
+    fn pumpfun_bonding_curve_and_v2_pda_differ_for_same_mint() {
+        let mint = Pubkey::new_unique();
+        let pda = get_bonding_curve_pda(&mint).unwrap();
+        let pda_v2 = get_bonding_curve_v2_pda(&mint).unwrap();
+        assert_ne!(pda, pda_v2, "bonding_curve and bonding_curve_v2 PDAs must differ");
+    }
+
+    #[test]
+    fn pumpfun_creator_vault_pda_deterministic() {
+        let creator = Pubkey::new_unique();
+        let a = get_creator_vault_pda(&creator).unwrap();
+        let b = get_creator_vault_pda(&creator).unwrap();
+        assert_eq!(a, b);
+    }
 }

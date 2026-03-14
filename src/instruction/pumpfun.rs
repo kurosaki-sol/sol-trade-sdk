@@ -8,8 +8,9 @@ use crate::{
 };
 use crate::{
     instruction::utils::pumpfun::{
-        accounts, get_bonding_curve_pda, get_creator, get_user_volume_accumulator_pda,
-        global_constants::{self},
+        accounts, get_bonding_curve_pda, get_bonding_curve_v2_pda, get_creator,
+        get_mayhem_fee_recipient_meta_random, get_user_volume_accumulator_pda,
+        global_constants::{self}, BUY_DISCRIMINATOR, BUY_EXACT_SOL_IN_DISCRIMINATOR, SELL_DISCRIMINATOR,
     },
     utils::calc::{
         common::{calculate_with_slippage_buy, calculate_with_slippage_sell},
@@ -63,7 +64,8 @@ impl InstructionBuilder for PumpFunInstructionBuilder {
         );
 
         let bonding_curve_addr = if bonding_curve.account == Pubkey::default() {
-            get_bonding_curve_pda(&params.output_mint).unwrap()
+            get_bonding_curve_pda(&params.output_mint)
+                .ok_or_else(|| anyhow!("bonding_curve PDA derivation failed for mint {}", params.output_mint))?
         } else {
             bonding_curve.account
         };
@@ -96,8 +98,8 @@ impl InstructionBuilder for PumpFunInstructionBuilder {
                 params.open_seed_optimize,
             );
 
-        let user_volume_accumulator =
-            get_user_volume_accumulator_pda(&params.payer.pubkey()).unwrap();
+        let user_volume_accumulator = get_user_volume_accumulator_pda(&params.payer.pubkey())
+            .ok_or_else(|| anyhow!("user_volume_accumulator PDA derivation failed"))?;
 
         // ========================================
         // Build instructions
@@ -117,19 +119,37 @@ impl InstructionBuilder for PumpFunInstructionBuilder {
             );
         }
 
-        let mut buy_data = [0u8; 24];
-        buy_data[..8].copy_from_slice(&[102, 6, 61, 18, 1, 218, 235, 234]); // Method ID
-        buy_data[8..16].copy_from_slice(&buy_token_amount.to_le_bytes());
-        buy_data[16..24].copy_from_slice(&max_sol_cost.to_le_bytes());
+        // IDL: buy/buy_exact_sol_in 第三参数 track_volume: OptionBool，仅代币支持返现时传 Some(true)
+        let track_volume = if bonding_curve.is_cashback_coin { [1u8, 1u8] } else { [1u8, 0u8] }; // Some(true) / Some(false)
+        let mut buy_data = [0u8; 26];
+        if params.use_exact_sol_amount.unwrap_or(true) {
+            // buy_exact_sol_in(spendable_sol_in: u64, min_tokens_out: u64, track_volume)
+            let min_tokens_out = calculate_with_slippage_sell(
+                buy_token_amount,
+                params.slippage_basis_points.unwrap_or(DEFAULT_SLIPPAGE),
+            );
+            buy_data[..8].copy_from_slice(&BUY_EXACT_SOL_IN_DISCRIMINATOR);
+            buy_data[8..16].copy_from_slice(&params.input_amount.unwrap_or(0).to_le_bytes());
+            buy_data[16..24].copy_from_slice(&min_tokens_out.to_le_bytes());
+            buy_data[24..26].copy_from_slice(&track_volume);
+        } else {
+            // buy(token_amount: u64, max_sol_cost: u64, track_volume)
+            buy_data[..8].copy_from_slice(&BUY_DISCRIMINATOR);
+            buy_data[8..16].copy_from_slice(&buy_token_amount.to_le_bytes());
+            buy_data[16..24].copy_from_slice(&max_sol_cost.to_le_bytes());
+            buy_data[24..26].copy_from_slice(&track_volume);
+        }
 
-        // Determine fee recipient based on mayhem mode
+        // Determine fee recipient based on mayhem mode (pump-public-docs: 2nd account = Mayhem fee recipient; use any one randomly)
         let fee_recipient_meta = if is_mayhem_mode {
-            global_constants::MAYHEM_FEE_RECIPIENT_META
+            get_mayhem_fee_recipient_meta_random()
         } else {
             global_constants::FEE_RECIPIENT_META
         };
 
-        let accounts: [AccountMeta; 16] = [
+        let bonding_curve_v2 = get_bonding_curve_v2_pda(&params.output_mint)
+            .ok_or_else(|| anyhow!("bonding_curve_v2 PDA derivation failed for mint {}", params.output_mint))?;
+        let mut accounts: Vec<AccountMeta> = vec![
             global_constants::GLOBAL_ACCOUNT_META,
             fee_recipient_meta,
             AccountMeta::new_readonly(params.output_mint, false),
@@ -147,11 +167,12 @@ impl InstructionBuilder for PumpFunInstructionBuilder {
             accounts::FEE_CONFIG_META,
             accounts::FEE_PROGRAM_META,
         ];
+        accounts.push(AccountMeta::new_readonly(bonding_curve_v2, false)); // remainingAccounts: @pump-fun/pump-sdk 要求末尾传 bondingCurveV2Pda(mint)，勿删
 
         instructions.push(Instruction::new_with_bytes(
             accounts::PUMPFUN,
             &buy_data,
-            accounts.to_vec(),
+            accounts,
         ));
 
         Ok(instructions)
@@ -199,7 +220,8 @@ impl InstructionBuilder for PumpFunInstructionBuilder {
         };
 
         let bonding_curve_addr = if bonding_curve.account == Pubkey::default() {
-            get_bonding_curve_pda(&params.input_mint).unwrap()
+            get_bonding_curve_pda(&params.input_mint)
+                .ok_or_else(|| anyhow!("bonding_curve PDA derivation failed for mint {}", params.input_mint))?
         } else {
             bonding_curve.account
         };
@@ -238,18 +260,18 @@ impl InstructionBuilder for PumpFunInstructionBuilder {
         let mut instructions = Vec::with_capacity(2);
 
         let mut sell_data = [0u8; 24];
-        sell_data[..8].copy_from_slice(&[51, 230, 133, 164, 1, 127, 131, 173]); // Method ID
+        sell_data[..8].copy_from_slice(&SELL_DISCRIMINATOR);
         sell_data[8..16].copy_from_slice(&token_amount.to_le_bytes());
         sell_data[16..24].copy_from_slice(&min_sol_output.to_le_bytes());
 
-        // Determine fee recipient based on mayhem mode
+        // Determine fee recipient based on mayhem mode (pump-public-docs: 2nd account = Mayhem fee recipient; use any one randomly)
         let fee_recipient_meta = if is_mayhem_mode {
-            global_constants::MAYHEM_FEE_RECIPIENT_META
+            get_mayhem_fee_recipient_meta_random()
         } else {
             global_constants::FEE_RECIPIENT_META
         };
 
-        let accounts: [AccountMeta; 14] = [
+        let mut accounts: Vec<AccountMeta> = vec![
             global_constants::GLOBAL_ACCOUNT_META,
             fee_recipient_meta,
             AccountMeta::new_readonly(params.input_mint, false),
@@ -266,10 +288,21 @@ impl InstructionBuilder for PumpFunInstructionBuilder {
             accounts::FEE_PROGRAM_META,
         ];
 
+        // Cashback: Bonding Curve Sell expects UserVolumeAccumulator PDA at 0th remaining account (writable)
+        if bonding_curve.is_cashback_coin {
+            let user_volume_accumulator = get_user_volume_accumulator_pda(&params.payer.pubkey())
+                .ok_or_else(|| anyhow!("user_volume_accumulator PDA derivation failed"))?;
+            accounts.push(AccountMeta::new(user_volume_accumulator, false));
+        }
+        // remainingAccounts: @pump-fun/pump-sdk sell 要求末尾传 bondingCurveV2Pda(mint)（cashback 时在 user_volume_accumulator 之后），勿删
+        let bonding_curve_v2 = get_bonding_curve_v2_pda(&params.input_mint)
+            .ok_or_else(|| anyhow!("bonding_curve_v2 PDA derivation failed for mint {}", params.input_mint))?;
+        accounts.push(AccountMeta::new_readonly(bonding_curve_v2, false));
+
         instructions.push(Instruction::new_with_bytes(
             accounts::PUMPFUN,
             &sell_data,
-            accounts.to_vec(),
+            accounts,
         ));
 
         // Optional: Close token account
@@ -287,4 +320,22 @@ impl InstructionBuilder for PumpFunInstructionBuilder {
 
         Ok(instructions)
     }
+}
+
+/// Claim cashback for Bonding Curve (Pump program). Transfers native lamports from UserVolumeAccumulator to user.
+pub fn claim_cashback_pumpfun_instruction(payer: &Pubkey) -> Option<Instruction> {
+    const CLAIM_CASHBACK_DISCRIMINATOR: [u8; 8] = [37, 58, 35, 126, 190, 53, 228, 197];
+    let user_volume_accumulator = get_user_volume_accumulator_pda(payer)?;
+    let accounts = vec![
+        AccountMeta::new(*payer, true),           // user (signer, writable)
+        AccountMeta::new(user_volume_accumulator, false), // user_volume_accumulator (writable, not signer)
+        crate::constants::SYSTEM_PROGRAM_META,
+        accounts::EVENT_AUTHORITY_META,
+        accounts::PUMPFUN_META,
+    ];
+    Some(Instruction::new_with_bytes(
+        accounts::PUMPFUN,
+        &CLAIM_CASHBACK_DISCRIMINATOR,
+        accounts,
+    ))
 }

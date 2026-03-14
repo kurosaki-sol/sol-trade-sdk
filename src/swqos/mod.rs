@@ -1,3 +1,4 @@
+pub mod astralane_quic;
 pub mod common;
 pub mod serialization;
 pub mod solana_rpc;
@@ -7,9 +8,15 @@ pub mod zeroslot;
 pub mod temporal;
 pub mod bloxroute;
 pub mod node1;
+pub mod node1_quic;
 pub mod flashblock;
 pub mod blockrazor;
 pub mod astralane;
+pub mod stellium;
+pub mod lightspeed;
+pub mod soyas;
+pub mod speedlanding;
+pub mod helius;
 
 use std::sync::Arc;
 
@@ -20,34 +27,78 @@ use tokio::sync::RwLock;
 use anyhow::Result;
 
 use crate::{
-    common::SolanaRpcClient, 
+    common::SolanaRpcClient,
     constants::swqos::{
-        SWQOS_ENDPOINTS_BLOX, 
-        SWQOS_ENDPOINTS_JITO, 
-        SWQOS_ENDPOINTS_NEXTBLOCK, 
-        SWQOS_ENDPOINTS_TEMPORAL, 
-        SWQOS_ENDPOINTS_ZERO_SLOT, 
-        SWQOS_ENDPOINTS_NODE1, 
+        SWQOS_ENDPOINTS_BLOX,
+        SWQOS_ENDPOINTS_JITO,
+        SWQOS_ENDPOINTS_NEXTBLOCK,
+        SWQOS_ENDPOINTS_TEMPORAL,
+        SWQOS_ENDPOINTS_ZERO_SLOT,
+        SWQOS_ENDPOINTS_NODE1,
+        SWQOS_ENDPOINTS_NODE1_QUIC,
         SWQOS_ENDPOINTS_FLASHBLOCK,
         SWQOS_ENDPOINTS_BLOCKRAZOR,
-        SWQOS_ENDPOINTS_ASTRALANE
-    }, 
+        SWQOS_ENDPOINTS_ASTRALANE,
+        SWQOS_ENDPOINTS_ASTRALANE_QUIC,
+        SWQOS_ENDPOINTS_STELLIUM,
+        SWQOS_ENDPOINTS_SOYAS,
+        SWQOS_ENDPOINTS_SPEEDLANDING,
+        SWQOS_ENDPOINTS_HELIUS,
+        SWQOS_MIN_TIP_DEFAULT,
+        SWQOS_MIN_TIP_JITO,
+        SWQOS_MIN_TIP_NEXTBLOCK,
+        SWQOS_MIN_TIP_ZERO_SLOT,
+        SWQOS_MIN_TIP_TEMPORAL,
+        SWQOS_MIN_TIP_BLOXROUTE,
+        SWQOS_MIN_TIP_NODE1,
+        SWQOS_MIN_TIP_FLASHBLOCK,
+        SWQOS_MIN_TIP_BLOCKRAZOR,
+        SWQOS_MIN_TIP_ASTRALANE,
+        SWQOS_MIN_TIP_STELLIUM,
+        SWQOS_MIN_TIP_LIGHTSPEED,
+        SWQOS_MIN_TIP_SOYAS,
+        SWQOS_MIN_TIP_SPEEDLANDING,
+        SWQOS_MIN_TIP_HELIUS,
+    },
     swqos::{
-        bloxroute::BloxrouteClient, 
-        jito::JitoClient, 
-        nextblock::NextBlockClient, 
-        solana_rpc::SolRpcClient, 
-        temporal::TemporalClient, 
-        zeroslot::ZeroSlotClient, 
-        node1::Node1Client, 
+        bloxroute::BloxrouteClient,
+        jito::JitoClient,
+        nextblock::NextBlockClient,
+        solana_rpc::SolRpcClient,
+        temporal::TemporalClient,
+        zeroslot::ZeroSlotClient,
+        node1::Node1Client,
+        node1_quic::Node1QuicClient,
         flashblock::FlashBlockClient,
         blockrazor::BlockRazorClient,
-        astralane::AstralaneClient
+        astralane::AstralaneClient,
+        stellium::StelliumClient,
+        lightspeed::LightspeedClient,
+        soyas::SoyasClient,
+        speedlanding::SpeedlandingClient,
+        helius::HeliusClient,
     }
 };
 
 lazy_static::lazy_static! {
+    /// Reserved for future per-SWQOS tip account caching (currently unused).
+    #[allow(dead_code)]
     static ref TIP_ACCOUNT_CACHE: RwLock<Vec<String>> = RwLock::new(Vec::new());
+}
+
+/// SWQOS provider blacklist configuration
+/// Providers added here will be disabled even if configured by user
+/// To enable a provider, remove it from this list
+pub const SWQOS_BLACKLIST: &[SwqosType] = &[
+    SwqosType::NextBlock,  // NextBlock is disabled by default
+];
+
+/// SWQOS 提交通道：HTTP 或 QUIC（低延迟）。部分提供商（如 Astralane）支持 QUIC。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum SwqosTransport {
+    #[default]
+    Http,
+    Quic,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -81,6 +132,11 @@ pub enum SwqosType {
     FlashBlock,
     BlockRazor,
     Astralane,
+    Stellium,
+    Lightspeed,
+    Soyas,
+    Speedlanding,
+    Helius,
     Default,
 }
 
@@ -96,6 +152,11 @@ impl SwqosType {
             Self::FlashBlock,
             Self::BlockRazor,
             Self::Astralane,
+            Self::Stellium,
+            Self::Lightspeed,
+            Self::Soyas,
+            Self::Speedlanding,
+            Self::Helius,
             Self::Default,
         ]
     }
@@ -105,10 +166,31 @@ pub type SwqosClient = dyn SwqosClientTrait + Send + Sync + 'static;
 
 #[async_trait::async_trait]
 pub trait SwqosClientTrait {
-    async fn send_transaction(&self, trade_type: TradeType, transaction: &VersionedTransaction) -> Result<()>;
-    async fn send_transactions(&self, trade_type: TradeType, transactions: &Vec<VersionedTransaction>) -> Result<()>;
+    async fn send_transaction(&self, trade_type: TradeType, transaction: &VersionedTransaction, wait_confirmation: bool) -> Result<()>;
+    async fn send_transactions(&self, trade_type: TradeType, transactions: &Vec<VersionedTransaction>, wait_confirmation: bool) -> Result<()>;
     fn get_tip_account(&self) -> Result<String>;
     fn get_swqos_type(&self) -> SwqosType;
+    /// Minimum tip in SOL required by this provider. Helius returns lower value when swqos_only is true.
+    #[inline]
+    fn min_tip_sol(&self) -> f64 {
+        match self.get_swqos_type() {
+            SwqosType::Jito => SWQOS_MIN_TIP_JITO,
+            SwqosType::NextBlock => SWQOS_MIN_TIP_NEXTBLOCK,
+            SwqosType::ZeroSlot => SWQOS_MIN_TIP_ZERO_SLOT,
+            SwqosType::Temporal => SWQOS_MIN_TIP_TEMPORAL,
+            SwqosType::Bloxroute => SWQOS_MIN_TIP_BLOXROUTE,
+            SwqosType::Node1 => SWQOS_MIN_TIP_NODE1,
+            SwqosType::FlashBlock => SWQOS_MIN_TIP_FLASHBLOCK,
+            SwqosType::BlockRazor => SWQOS_MIN_TIP_BLOCKRAZOR,
+            SwqosType::Astralane => SWQOS_MIN_TIP_ASTRALANE,
+            SwqosType::Stellium => SWQOS_MIN_TIP_STELLIUM,
+            SwqosType::Lightspeed => SWQOS_MIN_TIP_LIGHTSPEED,
+            SwqosType::Soyas => SWQOS_MIN_TIP_SOYAS,
+            SwqosType::Speedlanding => SWQOS_MIN_TIP_SPEEDLANDING,
+            SwqosType::Helius => SWQOS_MIN_TIP_HELIUS,
+            SwqosType::Default => SWQOS_MIN_TIP_DEFAULT,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -136,22 +218,61 @@ pub enum SwqosConfig {
     Temporal(String, SwqosRegion, Option<String>),
     /// ZeroSlot(api_token, region, custom_url)
     ZeroSlot(String, SwqosRegion, Option<String>),
-    /// Node1(api_token, region, custom_url)
-    Node1(String, SwqosRegion, Option<String>),
+    /// Node1(api_token, region, custom_url, transport). transport=None => HTTP; Some(Quic) => QUIC (port 16666, UUID auth).
+    Node1(String, SwqosRegion, Option<String>, Option<SwqosTransport>),
     /// FlashBlock(api_token, region, custom_url)
     FlashBlock(String, SwqosRegion, Option<String>),
     /// BlockRazor(api_token, region, custom_url)
     BlockRazor(String, SwqosRegion, Option<String>),
-    /// Astralane(api_token, region, custom_url)
-    Astralane(String, SwqosRegion, Option<String>),
+    /// Astralane(api_token, region, custom_url, transport). transport=None 表示 Http。
+    Astralane(String, SwqosRegion, Option<String>, Option<SwqosTransport>),
+    /// Stellium(api_token, region, custom_url)
+    Stellium(String, SwqosRegion, Option<String>),
+    /// Lightspeed(api_key, region, custom_url) - Solana Vibe Station
+    /// Endpoint format: https://<tier>.rpc.solanavibestation.com/lightspeed?api_key=<key>
+    /// Minimum tip: 0.001 SOL
+    Lightspeed(String, SwqosRegion, Option<String>),
+    /// Soyas(api_token, region, custom_url)
+    Soyas(String, SwqosRegion, Option<String>),
+    /// To apply for an API key, please contact -> https://t.me/speedlanding_bot?start=0xzero
+    /// Minimum tip: 0.001 SOL
+    Speedlanding(String, SwqosRegion, Option<String>),
+    /// Helius Sender: dual routing to validators and Jito. API key optional (custom TPS only).
+    /// (api_key, region, custom_url, swqos_only). swqos_only: None => false (min tip 0.0002 SOL); Some(true) => SWQOS-only (min tip 0.000005 SOL, much lower).
+    Helius(String, SwqosRegion, Option<String>, Option<bool>),
 }
 
 impl SwqosConfig {
+    pub fn swqos_type(&self) -> SwqosType{
+        match self {
+            SwqosConfig::Default(_) => SwqosType::Default,
+            SwqosConfig::Jito(_, _, _) => SwqosType::Jito,
+            SwqosConfig::NextBlock(_, _, _) => SwqosType::NextBlock,
+            SwqosConfig::Bloxroute(_, _, _) => SwqosType::Bloxroute,
+            SwqosConfig::Temporal(_, _, _) => SwqosType::Temporal,
+            SwqosConfig::ZeroSlot(_, _, _) => SwqosType::ZeroSlot,
+            SwqosConfig::Node1(_, _, _, _) => SwqosType::Node1,
+            SwqosConfig::FlashBlock(_, _, _) => SwqosType::FlashBlock,
+            SwqosConfig::BlockRazor(_, _, _) => SwqosType::BlockRazor,
+            SwqosConfig::Astralane(_, _, _, _) => SwqosType::Astralane,
+            SwqosConfig::Stellium(_, _, _) => SwqosType::Stellium,
+            SwqosConfig::Lightspeed(_, _, _) => SwqosType::Lightspeed,
+            SwqosConfig::Soyas(_, _, _) => SwqosType::Soyas,
+            SwqosConfig::Speedlanding(_, _, _) => SwqosType::Speedlanding,
+            SwqosConfig::Helius(_, _, _, _) => SwqosType::Helius,
+        }
+    }
+
+    /// Check if current config is in the blacklist
+    pub fn is_blacklisted(&self) -> bool {
+        SWQOS_BLACKLIST.contains(&self.swqos_type())
+    }
+
     pub fn get_endpoint(swqos_type: SwqosType, region: SwqosRegion, url: Option<String>) -> String {
         if let Some(custom_url) = url {
             return custom_url;
         }
-        
+
         match swqos_type {
             SwqosType::Jito => SWQOS_ENDPOINTS_JITO[region as usize].to_string(),
             SwqosType::NextBlock => SWQOS_ENDPOINTS_NEXTBLOCK[region as usize].to_string(),
@@ -162,11 +283,16 @@ impl SwqosConfig {
             SwqosType::FlashBlock => SWQOS_ENDPOINTS_FLASHBLOCK[region as usize].to_string(),
             SwqosType::BlockRazor => SWQOS_ENDPOINTS_BLOCKRAZOR[region as usize].to_string(),
             SwqosType::Astralane => SWQOS_ENDPOINTS_ASTRALANE[region as usize].to_string(),
+            SwqosType::Stellium => SWQOS_ENDPOINTS_STELLIUM[region as usize].to_string(),
+            SwqosType::Lightspeed => "".to_string(), // Lightspeed requires custom URL with api_key
+            SwqosType::Soyas => SWQOS_ENDPOINTS_SOYAS[region as usize].to_string(),
+            SwqosType::Speedlanding => SWQOS_ENDPOINTS_SPEEDLANDING[region as usize].to_string(),
+            SwqosType::Helius => SWQOS_ENDPOINTS_HELIUS[region as usize].to_string(),
             SwqosType::Default => "".to_string(),
         }
     }
 
-    pub fn get_swqos_client(rpc_url: String, commitment: CommitmentConfig, swqos_config: SwqosConfig) -> Arc<SwqosClient> {
+    pub async fn get_swqos_client(rpc_url: String, commitment: CommitmentConfig, swqos_config: SwqosConfig) -> Result<Arc<SwqosClient>> {
         match swqos_config {
             SwqosConfig::Jito(auth_token, region, url) => {
                 let endpoint = SwqosConfig::get_endpoint(SwqosType::Jito, region, url);
@@ -175,7 +301,7 @@ impl SwqosConfig {
                     endpoint,
                     auth_token
                 );
-                Arc::new(jito_client)
+                Ok(Arc::new(jito_client))
             }
             SwqosConfig::NextBlock(auth_token, region, url) => {
                 let endpoint = SwqosConfig::get_endpoint(SwqosType::NextBlock, region, url);
@@ -184,7 +310,7 @@ impl SwqosConfig {
                     endpoint.to_string(),
                     auth_token
                 );
-                Arc::new(nextblock_client)
+                Ok(Arc::new(nextblock_client))
             },
             SwqosConfig::ZeroSlot(auth_token, region, url) => {
                 let endpoint = SwqosConfig::get_endpoint(SwqosType::ZeroSlot, region, url);
@@ -193,7 +319,7 @@ impl SwqosConfig {
                     endpoint.to_string(),
                     auth_token
                 );
-                Arc::new(zeroslot_client)
+                Ok(Arc::new(zeroslot_client))
             },
             SwqosConfig::Temporal(auth_token, region, url) => {  
                 let endpoint = SwqosConfig::get_endpoint(SwqosType::Temporal, region, url);
@@ -202,7 +328,7 @@ impl SwqosConfig {
                     endpoint.to_string(),
                     auth_token
                 );
-                Arc::new(temporal_client)
+                Ok(Arc::new(temporal_client))
             },
             SwqosConfig::Bloxroute(auth_token, region, url) => { 
                 let endpoint = SwqosConfig::get_endpoint(SwqosType::Bloxroute, region, url);
@@ -211,16 +337,29 @@ impl SwqosConfig {
                     endpoint.to_string(),
                     auth_token
                 );
-                Arc::new(bloxroute_client)
+                Ok(Arc::new(bloxroute_client))
             },
-            SwqosConfig::Node1(auth_token, region, url) => {
-                let endpoint = SwqosConfig::get_endpoint(SwqosType::Node1, region, url);
-                let node1_client = Node1Client::new(
-                    rpc_url.clone(),
-                    endpoint.to_string(),
-                    auth_token
-                );
-                Arc::new(node1_client)
+            SwqosConfig::Node1(auth_token, region, url, transport) => {
+                let use_quic = transport.map_or(false, |t| t == SwqosTransport::Quic);
+                if use_quic {
+                    let quic_endpoint = url
+                        .unwrap_or_else(|| SWQOS_ENDPOINTS_NODE1_QUIC[region as usize].to_string());
+                    let node1_quic = Node1QuicClient::connect(
+                        &quic_endpoint,
+                        &auth_token,
+                        rpc_url.clone(),
+                    )
+                    .await?;
+                    Ok(Arc::new(node1_quic))
+                } else {
+                    let endpoint = SwqosConfig::get_endpoint(SwqosType::Node1, region, url);
+                    let node1_client = Node1Client::new(
+                        rpc_url.clone(),
+                        endpoint.to_string(),
+                        auth_token,
+                    );
+                    Ok(Arc::new(node1_client))
+                }
             },
             SwqosConfig::FlashBlock(auth_token, region, url) => {
                 let endpoint = SwqosConfig::get_endpoint(SwqosType::FlashBlock, region, url);
@@ -229,7 +368,7 @@ impl SwqosConfig {
                     endpoint.to_string(),
                     auth_token
                 );
-                Arc::new(flashblock_client)
+                Ok(Arc::new(flashblock_client))
             },
             SwqosConfig::BlockRazor(auth_token, region, url) => {
                 let endpoint = SwqosConfig::get_endpoint(SwqosType::BlockRazor, region, url);
@@ -238,24 +377,81 @@ impl SwqosConfig {
                     endpoint.to_string(),
                     auth_token
                 );
-                Arc::new(blockrazor_client)
+                Ok(Arc::new(blockrazor_client))
             },
-            SwqosConfig::Astralane(auth_token, region, url) => {
-                let endpoint = SwqosConfig::get_endpoint(SwqosType::Astralane, region, url);
-                let astralane_client = AstralaneClient::new(
+            SwqosConfig::Astralane(auth_token, region, url, transport) => {
+                let use_quic = transport.map_or(false, |t| t == SwqosTransport::Quic);
+                if use_quic {
+                    let quic_endpoint = url
+                        .unwrap_or_else(|| SWQOS_ENDPOINTS_ASTRALANE_QUIC[region as usize].to_string());
+                    let astralane_client =
+                        AstralaneClient::new_quic(rpc_url.clone(), &quic_endpoint, auth_token).await?;
+                    Ok(Arc::new(astralane_client))
+                } else {
+                    let endpoint = SwqosConfig::get_endpoint(SwqosType::Astralane, region, url);
+                    let astralane_client = AstralaneClient::new(
+                        rpc_url.clone(),
+                        endpoint.to_string(),
+                        auth_token,
+                    );
+                    Ok(Arc::new(astralane_client))
+                }
+            },
+            SwqosConfig::Stellium(auth_token, region, url) => {
+                let endpoint = SwqosConfig::get_endpoint(SwqosType::Stellium, region, url);
+                let stellium_client = StelliumClient::new(
                     rpc_url.clone(),
                     endpoint.to_string(),
                     auth_token
                 );
-                Arc::new(astralane_client)
+                Ok(Arc::new(stellium_client))
+            },
+            SwqosConfig::Lightspeed(auth_token, region, url) => {
+                let endpoint = SwqosConfig::get_endpoint(SwqosType::Lightspeed, region, url);
+                let lightspeed_client = LightspeedClient::new(
+                    rpc_url.clone(),
+                    endpoint.to_string(),
+                    auth_token
+                );
+                Ok(Arc::new(lightspeed_client))
+            },
+            SwqosConfig::Soyas(auth_token, region, url) => {
+                let endpoint = SwqosConfig::get_endpoint(SwqosType::Soyas, region, url);
+                let soyas_client = SoyasClient::new(
+                    rpc_url.clone(),
+                    endpoint.to_string(),
+                    auth_token
+                ).await?;
+                Ok(Arc::new(soyas_client))
+            },
+            SwqosConfig::Speedlanding(auth_token, region, url) => {
+                let endpoint = SwqosConfig::get_endpoint(SwqosType::Speedlanding, region, url);
+                let speedlanding_client = SpeedlandingClient::new(
+                    rpc_url.clone(),
+                    endpoint.to_string(),
+                    auth_token
+                ).await?;
+                Ok(Arc::new(speedlanding_client))
+            },
+            SwqosConfig::Helius(api_key, region, url, swqos_only) => {
+                let swqos_only = swqos_only.unwrap_or(false);
+                let endpoint = SwqosConfig::get_endpoint(SwqosType::Helius, region, url.clone());
+                let api_key_opt = if api_key.is_empty() { None } else { Some(api_key.clone()) };
+                let helius_client = HeliusClient::new(
+                    rpc_url.clone(),
+                    endpoint,
+                    api_key_opt,
+                    swqos_only,
+                );
+                Ok(Arc::new(helius_client))
             },
             SwqosConfig::Default(endpoint) => {
                 let rpc = SolanaRpcClient::new_with_commitment(
                     endpoint,
                     commitment
-                );   
+                );
                 let rpc_client = SolRpcClient::new(Arc::new(rpc));
-                Arc::new(rpc_client)
+                Ok(Arc::new(rpc_client))
             }
         }
     }
