@@ -12,7 +12,8 @@ use sol_trade_sdk::{
     swqos::SwqosConfig,
     trading::{
         core::params::{
-            BonkParams, PumpFunParams, PumpSwapParams, RaydiumAmmV4Params, RaydiumCpmmParams, DexParamEnum,
+            BonkParams, DexParamEnum, PumpFunParams, PumpSwapParams, RaydiumAmmV4Params,
+            RaydiumCpmmParams,
         },
         factory::DexType,
     },
@@ -626,7 +627,7 @@ async fn handle_buy_pumpfun(
         recent_blockhash: Some(recent_blockhash),
         extension_params: DexParamEnum::PumpFun(param),
         address_lookup_table_account: None,
-        wait_transaction_confirmed: true,
+        wait_tx_confirmed: true,
         create_input_token_ata: false,
         close_input_token_ata: false,
         create_mint_ata: create_mint_ata,
@@ -638,7 +639,7 @@ async fn handle_buy_pumpfun(
         grpc_recv_us: None,
     };
     match client.buy(buy_params).await {
-        Ok((_, signature, _)) => {
+        Ok((_, signature, _, _)) => {
             println!("   ✅ Successfully bought tokens from PumpFun!");
             println!("   ✅ Transaction Signature: {:?}", signature);
         }
@@ -682,7 +683,7 @@ async fn handle_buy_pumpswap(
         recent_blockhash: Some(recent_blockhash),
         extension_params: DexParamEnum::PumpSwap(param),
         address_lookup_table_account: None,
-        wait_transaction_confirmed: true,
+        wait_tx_confirmed: true,
         create_input_token_ata: true,
         close_input_token_ata: false,
         create_mint_ata: create_mint_ata,
@@ -694,7 +695,7 @@ async fn handle_buy_pumpswap(
         grpc_recv_us: None,
     };
     match client.buy(buy_params).await {
-        Ok((_, signature, _)) => {
+        Ok((_, signature, _, _)) => {
             println!("   ✅ Successfully bought tokens from PumpSwap!");
             println!("   ✅ Transaction Signature: {:?}", signature);
         }
@@ -721,7 +722,8 @@ async fn handle_buy_bonk(
         println!("   Slippage: {}%", slippage.unwrap());
     }
     let mint_pubkey = Pubkey::from_str(mint)?;
-    let param = BonkParams::from_mint_by_rpc(&client.infrastructure.rpc, &mint_pubkey, false).await?;
+    let param =
+        BonkParams::from_mint_by_rpc(&client.infrastructure.rpc, &mint_pubkey, false).await?;
     let recent_blockhash = client.infrastructure.rpc.get_latest_blockhash().await?;
     let sol_lamports = sol_str_to_lamports(sol_amount.to_string().as_str()).unwrap();
 
@@ -737,7 +739,7 @@ async fn handle_buy_bonk(
         recent_blockhash: Some(recent_blockhash),
         extension_params: DexParamEnum::Bonk(param),
         address_lookup_table_account: None,
-        wait_transaction_confirmed: true,
+        wait_tx_confirmed: true,
         create_input_token_ata: true,
         close_input_token_ata: false,
         create_mint_ata: create_mint_ata,
@@ -749,7 +751,7 @@ async fn handle_buy_bonk(
         grpc_recv_us: None,
     };
     match client.buy(buy_params).await {
-        Ok((_, signature, _)) => {
+        Ok((_, signature, _, _)) => {
             println!("   ✅ Successfully bought tokens from Bonk!");
             println!("   ✅ Transaction Signature: {:?}", signature);
         }
@@ -780,7 +782,8 @@ async fn handle_buy_raydium_v4(
 
     let mint_pubkey = Pubkey::from_str(mint)?;
     let amm_pubkey = Pubkey::from_str(amm)?;
-    let param = RaydiumAmmV4Params::from_amm_address_by_rpc(&client.infrastructure.rpc, amm_pubkey).await?;
+    let param =
+        RaydiumAmmV4Params::from_amm_address_by_rpc(&client.infrastructure.rpc, amm_pubkey).await?;
     let recent_blockhash = client.infrastructure.rpc.get_latest_blockhash().await?;
     let sol_lamports = sol_str_to_lamports(sol_amount.to_string().as_str()).unwrap();
 
@@ -796,7 +799,7 @@ async fn handle_buy_raydium_v4(
         recent_blockhash: Some(recent_blockhash),
         extension_params: DexParamEnum::RaydiumAmmV4(param),
         address_lookup_table_account: None,
-        wait_transaction_confirmed: true,
+        wait_tx_confirmed: true,
         create_input_token_ata: true,
         close_input_token_ata: false,
         create_mint_ata: create_mint_ata,
@@ -808,7 +811,7 @@ async fn handle_buy_raydium_v4(
         grpc_recv_us: None,
     };
     match client.buy(buy_params).await {
-        Ok((_, signature, _)) => {
+        Ok((_, signature, _, _)) => {
             println!("   ✅ Successfully bought tokens from Raydium V4!");
             println!("   ✅ Transaction Signature: {:?}", signature);
         }
@@ -839,7 +842,9 @@ async fn handle_buy_raydium_cpmm(
 
     let mint_pubkey = Pubkey::from_str(mint)?;
     let pool_pubkey = Pubkey::from_str(pool_address)?;
-    let param = RaydiumCpmmParams::from_pool_address_by_rpc(&client.infrastructure.rpc, &pool_pubkey).await?;
+    let param =
+        RaydiumCpmmParams::from_pool_address_by_rpc(&client.infrastructure.rpc, &pool_pubkey)
+            .await?;
     let recent_blockhash = client.infrastructure.rpc.get_latest_blockhash().await?;
     let sol_lamports = sol_str_to_lamports(sol_amount.to_string().as_str()).unwrap();
 
@@ -855,7 +860,7 @@ async fn handle_buy_raydium_cpmm(
         recent_blockhash: Some(recent_blockhash),
         extension_params: DexParamEnum::RaydiumCpmm(param),
         address_lookup_table_account: None,
-        wait_transaction_confirmed: true,
+        wait_tx_confirmed: true,
         create_input_token_ata: true,
         close_input_token_ata: false,
         create_mint_ata: create_mint_ata,
@@ -867,7 +872,7 @@ async fn handle_buy_raydium_cpmm(
         grpc_recv_us: None,
     };
     match client.buy(buy_params).await {
-        Ok((_, signature, _)) => {
+        Ok((_, signature, _, _)) => {
             println!("   ✅ Successfully bought tokens from Raydium CPMM!");
             println!("   ✅ Transaction Signature: {:?}", signature);
         }
@@ -1025,7 +1030,7 @@ async fn handle_sell_pumpfun(
         with_tip: false,
         extension_params: DexParamEnum::PumpFun(param),
         address_lookup_table_account: None,
-        wait_transaction_confirmed: true,
+        wait_tx_confirmed: true,
         create_output_token_ata: true,
         close_output_token_ata: false,
         close_mint_token_ata: false,
@@ -1037,7 +1042,7 @@ async fn handle_sell_pumpfun(
     };
 
     match client.sell(sell_params).await {
-        Ok((_, signature, _)) => {
+        Ok((_, signature, _, _)) => {
             println!("   ✅ Successfully sold tokens from PumpFun!");
             println!("   ✅ Transaction Signature: {:?}", signature);
         }
@@ -1084,7 +1089,7 @@ async fn handle_sell_pumpswap(
         with_tip: false,
         extension_params: DexParamEnum::PumpSwap(param),
         address_lookup_table_account: None,
-        wait_transaction_confirmed: true,
+        wait_tx_confirmed: true,
         create_output_token_ata: true,
         close_output_token_ata: false,
         close_mint_token_ata: false,
@@ -1095,9 +1100,9 @@ async fn handle_sell_pumpswap(
         grpc_recv_us: None,
     };
     match client.sell(sell_params).await {
-        Ok((_, signature, _)) => {
+        Ok((_, signature, _, _)) => {
             println!("   ✅ Successfully sold tokens from PumpSwap!");
-            println!("   ✅ Transaction Signature: {:?}", signature);  
+            println!("   ✅ Transaction Signature: {:?}", signature);
         }
         Err(e) => {
             println!("   ❌ Failed to sell tokens from PumpSwap: {}", e);
@@ -1126,7 +1131,8 @@ async fn handle_sell_bonk(
     }
     let client = initialize_real_client().await?;
     let mint_pubkey = Pubkey::from_str(mint)?;
-    let param = BonkParams::from_mint_by_rpc(&client.infrastructure.rpc, &mint_pubkey, false).await?;
+    let param =
+        BonkParams::from_mint_by_rpc(&client.infrastructure.rpc, &mint_pubkey, false).await?;
     let recent_blockhash = client.infrastructure.rpc.get_latest_blockhash().await?;
 
     let gas_fee_strategy = sol_trade_sdk::common::GasFeeStrategy::new();
@@ -1142,7 +1148,7 @@ async fn handle_sell_bonk(
         with_tip: false,
         extension_params: DexParamEnum::Bonk(param),
         address_lookup_table_account: None,
-        wait_transaction_confirmed: true,
+        wait_tx_confirmed: true,
         create_output_token_ata: true,
         close_output_token_ata: false,
         close_mint_token_ata: false,
@@ -1153,7 +1159,7 @@ async fn handle_sell_bonk(
         grpc_recv_us: None,
     };
     match client.sell(sell_params).await {
-        Ok((_, signature, _)) => {
+        Ok((_, signature, _, _)) => {
             println!("   ✅ Successfully sold tokens from Bonk!");
             println!("   ✅ Transaction Signature: {:?}", signature);
         }
@@ -1187,7 +1193,8 @@ async fn handle_sell_raydium_v4(
     let client = initialize_real_client().await?;
     let amm_pubkey = Pubkey::from_str(amm)?;
     let mint_pubkey = Pubkey::from_str(mint)?;
-    let param = RaydiumAmmV4Params::from_amm_address_by_rpc(&client.infrastructure.rpc, amm_pubkey).await?;
+    let param =
+        RaydiumAmmV4Params::from_amm_address_by_rpc(&client.infrastructure.rpc, amm_pubkey).await?;
     let recent_blockhash = client.infrastructure.rpc.get_latest_blockhash().await?;
 
     let gas_fee_strategy = sol_trade_sdk::common::GasFeeStrategy::new();
@@ -1203,7 +1210,7 @@ async fn handle_sell_raydium_v4(
         with_tip: false,
         extension_params: DexParamEnum::RaydiumAmmV4(param),
         address_lookup_table_account: None,
-        wait_transaction_confirmed: true,
+        wait_tx_confirmed: true,
         create_output_token_ata: true,
         close_output_token_ata: false,
         close_mint_token_ata: false,
@@ -1214,7 +1221,7 @@ async fn handle_sell_raydium_v4(
         grpc_recv_us: None,
     };
     match client.sell(sell_params).await {
-        Ok((_, signature, _)) => {
+        Ok((_, signature, _, _)) => {
             println!("   ✅ Successfully sold tokens from Raydium V4!");
             println!("   ✅ Transaction Signature: {:?}", signature);
         }
@@ -1248,7 +1255,9 @@ async fn handle_sell_raydium_cpmm(
     let client = initialize_real_client().await?;
     let pool_pubkey = Pubkey::from_str(pool_address)?;
     let mint_pubkey = Pubkey::from_str(mint)?;
-    let param = RaydiumCpmmParams::from_pool_address_by_rpc(&client.infrastructure.rpc, &pool_pubkey).await?;
+    let param =
+        RaydiumCpmmParams::from_pool_address_by_rpc(&client.infrastructure.rpc, &pool_pubkey)
+            .await?;
     let recent_blockhash = client.infrastructure.rpc.get_latest_blockhash().await?;
 
     let gas_fee_strategy = sol_trade_sdk::common::GasFeeStrategy::new();
@@ -1264,7 +1273,7 @@ async fn handle_sell_raydium_cpmm(
         with_tip: false,
         extension_params: DexParamEnum::RaydiumCpmm(param),
         address_lookup_table_account: None,
-        wait_transaction_confirmed: true,
+        wait_tx_confirmed: true,
         create_output_token_ata: true,
         close_output_token_ata: false,
         close_mint_token_ata: false,
@@ -1275,7 +1284,7 @@ async fn handle_sell_raydium_cpmm(
         grpc_recv_us: None,
     };
     match client.sell(sell_params).await {
-        Ok((_, signature, _)) => {
+        Ok((_, signature, _, _)) => {
             println!("   ✅ Successfully sold tokens from Raydium CPMM!");
             println!("   ✅ Transaction Signature: {:?}", signature);
         }
@@ -1383,7 +1392,14 @@ async fn initialize_real_client() -> AnyResult<SolanaTrade> {
     let rpc_url = RPC_URL.to_string();
     let commitment = CommitmentConfig::confirmed();
     let swqos_configs: Vec<SwqosConfig> = vec![SwqosConfig::Default(rpc_url.clone())];
-    let trade_config = TradeConfig::new(rpc_url, swqos_configs, commitment);
+    let trade_config = TradeConfig::builder(rpc_url, swqos_configs, commitment)
+        // .create_wsol_ata_on_startup(true)  // default: true
+        // .use_seed_optimize(true)            // default: true
+        // .log_enabled(true)                  // default: true
+        // .check_min_tip(false)               // default: false
+        // .swqos_cores_from_end(false)        // default: false
+        // .mev_protection(false)              // default: false
+        .build();
     let solana_trade = SolanaTrade::new(payer, trade_config).await;
     println!("✅ SolanaTrade client initialized successfully!");
     Ok(solana_trade)

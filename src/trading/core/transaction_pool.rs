@@ -12,13 +12,19 @@ const TX_BUILDER_INSTRUCTION_CAP: usize = 32;
 const TX_BUILDER_LOOKUP_TABLE_CAP: usize = 8;
 /// 对象池最大容量
 const TX_BUILDER_POOL_CAP: usize = 1000;
-/// 启动时预填充对象池数量
-const TX_BUILDER_POOL_PREFILL: usize = 100;
+/// 多路提交并发数（与 async_executor SWQOS_DEDICATED_DEFAULT_THREADS 一致，保证不串行）
+const PARALLEL_SENDER_COUNT: usize = 18;
+/// 启动时预填充数量，必须 >= PARALLEL_SENDER_COUNT，否则 18 路并发 build 会触发分配或争抢
+const TX_BUILDER_POOL_PREFILL: usize = 64;
 
 use crossbeam_queue::ArrayQueue;
 use once_cell::sync::Lazy;
+use solana_message::AddressLookupTableAccount;
 use solana_sdk::{
-    hash::Hash, instruction::Instruction, message::{v0, AddressLookupTableAccount, Message, VersionedMessage}, pubkey::Pubkey
+    hash::Hash,
+    instruction::Instruction,
+    message::{v0, Message, VersionedMessage},
+    pubkey::Pubkey,
 };
 use std::sync::Arc;
 /// 预分配的交易构建器
@@ -91,11 +97,8 @@ impl PreallocatedTxBuilder {
             VersionedMessage::V0(message)
         } else {
             // ✅ 没有查找表，使用 Legacy 消息（兼容所有 RPC）
-            let message = Message::new_with_blockhash(
-                &self.instructions,
-                Some(payer),
-                &recent_blockhash,
-            );
+            let message =
+                Message::new_with_blockhash(&self.instructions, Some(payer), &recent_blockhash);
             VersionedMessage::Legacy(message)
         }
     }
@@ -104,20 +107,17 @@ impl PreallocatedTxBuilder {
 /// 🚀 全局交易构建器对象池
 static TX_BUILDER_POOL: Lazy<Arc<ArrayQueue<PreallocatedTxBuilder>>> = Lazy::new(|| {
     let pool = ArrayQueue::new(TX_BUILDER_POOL_CAP);
-
-    for _ in 0..TX_BUILDER_POOL_PREFILL {
+    let prefill = TX_BUILDER_POOL_PREFILL.max(PARALLEL_SENDER_COUNT);
+    for _ in 0..prefill {
         let _ = pool.push(PreallocatedTxBuilder::new());
     }
-
     Arc::new(pool)
 });
 
 /// 🚀 从池中获取构建器
 #[inline(always)]
 pub fn acquire_builder() -> PreallocatedTxBuilder {
-    TX_BUILDER_POOL
-        .pop()
-        .unwrap_or_else(|| PreallocatedTxBuilder::new())
+    TX_BUILDER_POOL.pop().unwrap_or_else(|| PreallocatedTxBuilder::new())
 }
 
 /// 🚀 归还构建器到池
@@ -139,9 +139,7 @@ pub struct TxBuilderGuard {
 
 impl TxBuilderGuard {
     pub fn new() -> Self {
-        Self {
-            builder: Some(acquire_builder()),
-        }
+        Self { builder: Some(acquire_builder()) }
     }
 
     pub fn get_mut(&mut self) -> &mut PreallocatedTxBuilder {
