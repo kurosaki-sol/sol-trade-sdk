@@ -61,7 +61,7 @@ pub struct SwapParams {
     pub output_token_program: Option<Pubkey>,
     pub input_amount: Option<u64>,
     pub slippage_basis_points: Option<u64>,
-    pub address_lookup_table_account: Option<AddressLookupTableAccount>,
+    pub address_lookup_table_accounts: Vec<AddressLookupTableAccount>,
     pub recent_blockhash: Option<Hash>,
     pub wait_tx_confirmed: bool,
     pub protocol_params: DexParamEnum,
@@ -82,6 +82,16 @@ pub struct SwapParams {
     pub simulate: bool,
     /// Whether to output SDK logs (from TradeConfig.log_enabled).
     pub log_enabled: bool,
+    /// When true, wait for every SWQOS route's HTTP submit response before
+    /// returning so the result includes all submitted signatures.
+    ///
+    /// This is useful when confirmation or external monitoring polls all
+    /// signatures: each route can submit a distinct transaction because relay
+    /// tips may use different accounts. With a durable nonce, at most one route
+    /// can consume the nonce; with a recent blockhash, multiple route variants
+    /// may be valid, so callers must choose strategy and account state
+    /// accordingly. Defaults to false for lower submit latency.
+    pub wait_for_all_submits: bool,
     /// Use dedicated sender threads (internal; set via client.with_dedicated_sender_threads()).
     pub use_dedicated_sender_threads: bool,
     /// Core indices for dedicated sender threads (from TradeConfig.sender_thread_cores). Arc avoids cloning the Vec on hot path.
@@ -94,14 +104,11 @@ pub struct SwapParams {
     pub check_min_tip: bool,
     /// Optional event receive time in microseconds (same scale as sol-parser-sdk clock::now_micros). Used as timing start when log_enabled.
     pub grpc_recv_us: Option<i64>,
-    /// Use exact SOL amount instructions (buy_exact_sol_in for PumpFun, buy_exact_quote_in for PumpSwap).
+    /// Use exact quote-input buy instructions (legacy PumpFun uses SOL quote; V2/PumpSwap use generic quote).
     /// When Some(true) or None (default), the exact SOL/quote amount is spent and slippage is applied to output tokens.
     /// When Some(false), uses regular buy instruction where slippage is applied to SOL/quote input.
     /// This option only applies to PumpFun and PumpSwap DEXes; it is ignored for other DEXes.
     pub use_exact_sol_amount: Option<bool>,
-    /// Use PumpFun V2 instructions (buy_v2 / sell_v2 / buy_exact_quote_in_v2, 27/26-account metas, quote_mint support).
-    /// Default: `false` keeps legacy SOL-paired instructions for smaller transactions; V2 is the official future-proof interface.
-    pub use_pumpfun_v2: bool,
 }
 
 impl SwapParams {

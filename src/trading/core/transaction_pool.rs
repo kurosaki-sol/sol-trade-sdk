@@ -17,6 +17,7 @@ const PARALLEL_SENDER_COUNT: usize = 18;
 /// 启动时预填充数量，必须 >= PARALLEL_SENDER_COUNT，否则 18 路并发 build 会触发分配或争抢
 const TX_BUILDER_POOL_PREFILL: usize = 64;
 
+use anyhow::Result;
 use crossbeam_queue::ArrayQueue;
 use once_cell::sync::Lazy;
 use solana_message::AddressLookupTableAccount;
@@ -54,7 +55,7 @@ impl PreallocatedTxBuilder {
     ///
     /// # 交易版本自动选择
     ///
-    /// - **有地址查找表** (`lookup_table = Some`): 使用 `VersionedMessage::V0`
+    /// - **有地址查找表** (`lookup_tables` 非空): 使用 `VersionedMessage::V0`
     ///   - 支持地址查找表压缩
     ///   - 减少交易大小
     ///   - 需要 RPC 支持 V0
@@ -68,11 +69,11 @@ impl PreallocatedTxBuilder {
     ///
     /// ```rust,ignore
     /// // 无查找表 -> Legacy 消息
-    /// let msg = builder.build_zero_alloc(&payer, &ixs, None, blockhash);
+    /// let msg = builder.build_zero_alloc(&payer, &ixs, &[], blockhash);
     /// assert!(matches!(msg, VersionedMessage::Legacy(_)));
     ///
     /// // 有查找表 -> V0 消息
-    /// let msg = builder.build_zero_alloc(&payer, &ixs, Some(table_key), blockhash);
+    /// let msg = builder.build_zero_alloc(&payer, &ixs, &[lookup_table], blockhash);
     /// assert!(matches!(msg, VersionedMessage::V0(_)));
     /// ```
     #[inline(always)]
@@ -80,26 +81,25 @@ impl PreallocatedTxBuilder {
         &mut self,
         payer: &Pubkey,
         instructions: &[Instruction],
-        address_lookup_table_account: Option<&AddressLookupTableAccount>,
+        address_lookup_table_accounts: &[AddressLookupTableAccount],
         recent_blockhash: Hash,
-    ) -> VersionedMessage {
+    ) -> Result<VersionedMessage> {
         self.reset();
         self.instructions.extend_from_slice(instructions);
 
-        if let Some(alt) = address_lookup_table_account {
+        if !address_lookup_table_accounts.is_empty() {
             let message = v0::Message::try_compile(
                 payer,
                 &self.instructions,
-                std::slice::from_ref(alt),
+                address_lookup_table_accounts,
                 recent_blockhash,
-            )
-            .expect("v0 message compile failed");
-            VersionedMessage::V0(message)
+            )?;
+            Ok(VersionedMessage::V0(message))
         } else {
             // ✅ 没有查找表，使用 Legacy 消息（兼容所有 RPC）
             let message =
                 Message::new_with_blockhash(&self.instructions, Some(payer), &recent_blockhash);
-            VersionedMessage::Legacy(message)
+            Ok(VersionedMessage::Legacy(message))
         }
     }
 }

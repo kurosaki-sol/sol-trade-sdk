@@ -1,4 +1,5 @@
-use crate::swqos::SwqosConfig;
+use crate::common::GasFeeStrategyType;
+use crate::swqos::{SwqosConfig, SwqosType};
 use solana_commitment_config::CommitmentConfig;
 use std::hash::{Hash, Hasher};
 
@@ -12,8 +13,8 @@ pub struct InfrastructureConfig {
     /// When true, SWQOS sender threads use the *last* N cores instead of the first N. Reduces contention with main thread / default tokio workers that often use low-numbered cores. Default false.
     pub swqos_cores_from_end: bool,
     /// Global MEV protection flag. When true, SWQOS providers that support MEV protection
-    /// (Astralane QUIC `:9000` or HTTP `mev-protect=true`, BlockRazor) use MEV-protected
-    /// endpoints/modes. Default false.
+    /// (Astralane, BlockRazor, Glaive) use MEV-protected endpoints/modes. Glaive HTTP adds
+    /// `mev-protect=true`; Glaive QUIC sets auth-frame flag bit 0. Default false.
     pub mev_protection: bool,
 }
 
@@ -75,6 +76,13 @@ impl PartialEq for InfrastructureConfig {
 
 impl Eq for InfrastructureConfig {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SwqosSubmitTiming {
+    pub swqos_type: SwqosType,
+    pub strategy_type: GasFeeStrategyType,
+    pub submit_done_us: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct TradeConfig {
     pub rpc_url: String,
@@ -92,12 +100,9 @@ pub struct TradeConfig {
     /// When true, SWQOS uses the *last* N cores (instead of the first N). Use when main thread / tokio use low-numbered cores to reduce CPU contention. Default false.
     pub swqos_cores_from_end: bool,
     /// Global MEV protection flag. When true, SWQOS providers that support MEV protection
-    /// (Astralane QUIC `:9000` or Plain/Binary HTTP `mev-protect=true`, BlockRazor sandwichMitigation)
-    /// use their MEV-protected endpoints/modes. Default false (no MEV protection, lower latency).
+    /// (Astralane, BlockRazor, Glaive) use their MEV-protected endpoints/modes. Glaive HTTP
+    /// adds `mev-protect=true`; Glaive QUIC sets auth-frame flag bit 0. Default false.
     pub mev_protection: bool,
-    /// Use PumpFun V2 instructions (buy_v2 / sell_v2, 27/26-account metas, quote_mint support).
-    /// Default: `false` keeps legacy SOL-paired instructions for smaller transactions; V2 is the official future-proof interface.
-    pub use_pumpfun_v2: bool,
 }
 
 impl TradeConfig {
@@ -109,7 +114,7 @@ impl TradeConfig {
     /// - `.log_enabled(bool)`                 — SDK timing/SWQOS logs (default: true)
     /// - `.check_min_tip(bool)`               — filter SWQOS below min tip (default: false)
     /// - `.swqos_cores_from_end(bool)`        — bind SWQOS to last N cores (default: false)
-    /// - `.mev_protection(bool)`              — MEV protection for Astralane/BlockRazor (default: false)
+    /// - `.mev_protection(bool)`              — MEV protection for Astralane/BlockRazor/Glaive (default: false)
     ///
     /// # Example
     /// ```rust,ignore
@@ -152,7 +157,6 @@ pub struct TradeConfigBuilder {
     check_min_tip: bool,
     swqos_cores_from_end: bool,
     mev_protection: bool,
-    use_pumpfun_v2: bool,
 }
 
 impl TradeConfigBuilder {
@@ -167,7 +171,6 @@ impl TradeConfigBuilder {
             check_min_tip: false,
             swqos_cores_from_end: false,
             mev_protection: false,
-            use_pumpfun_v2: false,
         }
     }
 
@@ -206,18 +209,11 @@ impl TradeConfigBuilder {
     /// Enable global MEV protection. When `true`:
     /// - **Astralane QUIC** uses port `9000`; **Astralane HTTP** adds `mev-protect=true`
     /// - **BlockRazor** uses `mode=sandwichMitigation` (skips blacklisted Leader slots)
+    /// - **Glaive HTTP** adds `mev-protect=true`; **Glaive QUIC** sets auth-frame flag bit 0
     ///
     /// May reduce landing speed. Default: `false`.
     pub fn mev_protection(mut self, v: bool) -> Self {
         self.mev_protection = v;
-        self
-    }
-
-    /// Use PumpFun V2 instructions (`buy_v2` / `sell_v2`, 27-account metas, `quote_mint` support).
-    /// Default: `false` (V1 — 18-account metas, legacy SOL-paired, smaller transaction).
-    /// Set to `true` when PumpFun officially deploys V2 on mainnet.
-    pub fn use_pumpfun_v2(mut self, v: bool) -> Self {
-        self.use_pumpfun_v2 = v;
         self
     }
 
@@ -233,7 +229,6 @@ impl TradeConfigBuilder {
             check_min_tip: self.check_min_tip,
             swqos_cores_from_end: self.swqos_cores_from_end,
             mev_protection: self.mev_protection,
-            use_pumpfun_v2: self.use_pumpfun_v2,
         }
     }
 }

@@ -14,6 +14,7 @@ use crate::constants::WSOL_TOKEN_ACCOUNT;
 use crate::swqos::common::TradeError;
 use crate::swqos::SwqosClient;
 use crate::swqos::SwqosConfig;
+use crate::swqos::SwqosType;
 use crate::swqos::TradeType;
 use crate::trading::core::params::BonkParams;
 use crate::trading::core::params::DexParamEnum;
@@ -49,6 +50,15 @@ fn validate_protocol_params(dex_type: DexType, params: &DexParamEnum) -> bool {
     }
 }
 
+#[inline]
+fn normalize_swqos_configs(rpc_url: &str, configs: &[SwqosConfig]) -> Vec<SwqosConfig> {
+    let mut out = configs.to_vec();
+    if !out.iter().any(|c| matches!(c.swqos_type(), SwqosType::Default)) {
+        out.push(SwqosConfig::Default(rpc_url.to_string()));
+    }
+    out
+}
+
 /// 按 mint 查找池地址（通用入口，根据 DEX 类型分发，仅 PumpSwap 等已实现的类型会走优化路径）。
 ///
 /// * `dex_type`：PumpSwap 时先走 PDA 再回退 getProgramAccounts，其他类型返回未实现错误。
@@ -72,6 +82,428 @@ pub enum TradeTokenType {
     USDC,
 }
 
+/// Account lifecycle policy for high-level trade requests.
+///
+/// This replaces low-level flags such as `create_input_token_ata`,
+/// `close_input_token_ata`, `create_mint_ata`, and `create_output_token_ata`.
+/// Use this when calling [`TradingClient::buy_simple`] or [`TradingClient::sell_simple`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountPolicy {
+    /// SDK chooses a practical default for the protocol and token route.
+    ///
+    /// Buy: create the target token ATA because the wallet usually needs a place
+    /// to receive the bought token.
+    ///
+    /// Sell: create the output ATA only when receiving an SPL token such as USDC
+    /// or WSOL. Receiving native SOL does not need an ATA.
+    Auto,
+    /// Keep the transaction small for sniping/arbitrage; assume hot accounts are prepared.
+    ///
+    /// This avoids ATA create/close instructions in the trade transaction. It is
+    /// the recommended policy for latency-sensitive bots that pre-create WSOL
+    /// and token ATAs outside the hot path.
+    HotPathMinimal,
+    /// Include ATA create instructions when the route needs them.
+    ///
+    /// This is more convenient for normal trading but can make PumpFun V2 and
+    /// other large transactions exceed Solana packet size limits unless an ALT
+    /// is supplied or the transaction builder can compact optional instructions.
+    CreateMissing,
+    /// Do not create or close token accounts in the trade transaction.
+    ///
+    /// Use this when the caller has already prepared all required ATAs and wants
+    /// deterministic instruction layout. Unlike `HotPathMinimal`, this name is
+    /// intended for correctness/readability rather than bot latency.
+    AssumePrepared,
+}
+
+/// High-level buy sizing intent.
+///
+/// This replaces `input_token_amount`, `fixed_output_token_amount`, and
+/// `use_exact_sol_amount` in [`TradeBuyParams`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuyAmount {
+    /// Spend this exact quote amount and apply slippage to minimum output.
+    ///
+    /// Example: spend exactly `0.1 SOL` or exactly `100 USDC` worth of quote
+    /// token; if the received token amount is below the slippage-adjusted
+    /// minimum, the transaction fails.
+    ExactInput(u64),
+    /// Buy an exact token amount, using `max_input_amount` as the quote budget.
+    ///
+    /// Example: buy exactly `1_000_000` token base units, but fail if the quote
+    /// cost would exceed `max_input_amount`.
+    ExactOutput { output_amount: u64, max_input_amount: u64 },
+    /// Regular PumpFun/PumpSwap buy: estimate output from `quote_amount` and apply slippage to max quote cost.
+    ///
+    /// This maps to `use_exact_sol_amount = Some(false)` in the old API. It is
+    /// useful for bots that want to know the intended token output from the SDK
+    /// calculation while letting the chain fail if the max quote budget is
+    /// exceeded.
+    WithMaxInput { quote_amount: u64 },
+}
+
+/// High-level sell sizing intent.
+///
+/// This replaces `input_token_amount` and `fixed_output_token_amount` in
+/// [`TradeSellParams`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SellAmount {
+    /// Sell this exact token amount and apply slippage to minimum output.
+    ///
+    /// Example: sell exactly `1_000_000` token base units and fail if the
+    /// received quote amount is below the slippage-adjusted minimum.
+    ExactInput(u64),
+    /// Exact-output sell where supported; `max_input_amount` is the token budget.
+    ///
+    /// Example: receive exactly `0.1 SOL` or `100 USDC`, but spend no more than
+    /// `max_input_amount` token base units.
+    ExactOutput { output_amount: u64, max_input_amount: u64 },
+}
+
+/// Simpler buy request that describes trade intent instead of low-level ATA flags.
+///
+/// Prefer constructing this with [`SimpleBuyParams::new`] or
+/// [`SimpleBuyParams::with_durable_nonce`], then optionally set slippage,
+/// account policy, ALT, simulation, or confirmation flags through builder-style
+/// methods.
+#[derive(Clone)]
+pub struct SimpleBuyParams {
+    /// DEX/protocol to route through, such as `DexType::PumpFun`.
+    pub dex_type: DexType,
+    /// Quote token used to pay for the buy: `SOL`, `WSOL`, `USDC`, or `USD1`.
+    ///
+    /// For PumpFun SOL-paired coins, use `TradeTokenType::SOL` for the normal
+    /// fast path even when parser data reports WSOL as the quote sentinel. The
+    /// SDK will prefer V1; choose `WSOL` only when intentionally spending an
+    /// existing WSOL ATA through V2.
+    pub pay_with: TradeTokenType,
+    /// Mint address of the token being bought.
+    pub mint: Pubkey,
+    /// Buy sizing intent. See [`BuyAmount`].
+    pub amount: BuyAmount,
+    /// Optional slippage in basis points. `100` means 1%.
+    pub slippage_basis_points: Option<u64>,
+    /// Recent blockhash for non-nonce transactions.
+    ///
+    /// The SDK intentionally does not fetch blockhash on the hot path. Use
+    /// [`SimpleBuyParams::with_durable_nonce`] only when the caller specifically
+    /// wants durable-nonce transactions.
+    pub recent_blockhash: Option<Hash>,
+    /// Protocol-specific parameters, for example `DexParamEnum::PumpFun(...)`.
+    pub extension_params: DexParamEnum,
+    /// Compute unit price/limit and relay tip configuration.
+    pub gas_fee_strategy: GasFeeStrategy,
+    /// ATA creation/close behavior. See [`AccountPolicy`].
+    pub account_policy: AccountPolicy,
+    /// Optional Address Lookup Tables to reduce transaction size.
+    /// Pass one element for a single ALT or multiple elements for multi-ALT.
+    pub address_lookup_table_accounts: Vec<AddressLookupTableAccount>,
+    /// Wait until the transaction is confirmed before returning.
+    pub wait_tx_confirmed: bool,
+    /// Wait for every SWQoS route's submit response so all signatures can be
+    /// returned. Useful when confirming through poll-any semantics or monitoring
+    /// route variants externally. Recent-blockhash variants are not mutually
+    /// exclusive; durable nonce variants are.
+    pub wait_for_all_submits: bool,
+    /// Durable nonce info. Mutually exclusive with `recent_blockhash`.
+    pub durable_nonce: Option<DurableNonceInfo>,
+    /// Build and simulate the transaction instead of submitting it.
+    pub simulate: bool,
+    /// Optional upstream receive timestamp in microseconds for latency tracing.
+    pub grpc_recv_us: Option<i64>,
+}
+
+/// Simpler sell request that describes trade intent instead of low-level ATA flags.
+///
+/// Prefer constructing this with [`SimpleSellParams::new`] or
+/// [`SimpleSellParams::with_durable_nonce`].
+#[derive(Clone)]
+pub struct SimpleSellParams {
+    /// DEX/protocol to route through, such as `DexType::PumpFun`.
+    pub dex_type: DexType,
+    /// Quote token to receive from the sell: `SOL`, `WSOL`, `USDC`, or `USD1`.
+    pub receive_as: TradeTokenType,
+    /// Mint address of the token being sold.
+    pub mint: Pubkey,
+    /// Sell sizing intent. See [`SellAmount`].
+    pub amount: SellAmount,
+    /// Optional slippage in basis points. `100` means 1%.
+    pub slippage_basis_points: Option<u64>,
+    /// Recent blockhash for non-nonce transactions.
+    pub recent_blockhash: Option<Hash>,
+    /// Protocol-specific parameters, for example `DexParamEnum::PumpFun(...)`.
+    pub extension_params: DexParamEnum,
+    /// Compute unit price/limit and relay tip configuration.
+    pub gas_fee_strategy: GasFeeStrategy,
+    /// ATA creation/close behavior. See [`AccountPolicy`].
+    pub account_policy: AccountPolicy,
+    /// Optional Address Lookup Tables to reduce transaction size.
+    /// Pass one element for a single ALT or multiple elements for multi-ALT.
+    pub address_lookup_table_accounts: Vec<AddressLookupTableAccount>,
+    /// Wait until the transaction is confirmed before returning.
+    pub wait_tx_confirmed: bool,
+    /// Wait for every SWQoS route's submit response so all signatures can be
+    /// returned. Useful when confirming through poll-any semantics or monitoring
+    /// route variants externally. Recent-blockhash variants are not mutually
+    /// exclusive; durable nonce variants are.
+    pub wait_for_all_submits: bool,
+    /// Durable nonce info. Mutually exclusive with `recent_blockhash`.
+    pub durable_nonce: Option<DurableNonceInfo>,
+    /// Build and simulate the transaction instead of submitting it.
+    pub simulate: bool,
+    /// Whether to include relay tips for sell transactions.
+    pub with_tip: bool,
+    /// Optional upstream receive timestamp in microseconds for latency tracing.
+    pub grpc_recv_us: Option<i64>,
+}
+
+impl SimpleBuyParams {
+    /// Create a simple buy request using a recent blockhash.
+    ///
+    /// Defaults:
+    /// - `account_policy = AccountPolicy::Auto`
+    /// - `wait_tx_confirmed = false`
+    /// - `wait_for_all_submits = false`
+    /// - `simulate = false`
+    /// - no ALT
+    /// - no slippage override
+    pub fn new(
+        dex_type: DexType,
+        pay_with: TradeTokenType,
+        mint: Pubkey,
+        amount: BuyAmount,
+        extension_params: DexParamEnum,
+        recent_blockhash: Hash,
+        gas_fee_strategy: GasFeeStrategy,
+    ) -> Self {
+        Self {
+            dex_type,
+            pay_with,
+            mint,
+            amount,
+            slippage_basis_points: None,
+            recent_blockhash: Some(recent_blockhash),
+            extension_params,
+            gas_fee_strategy,
+            account_policy: AccountPolicy::Auto,
+            address_lookup_table_accounts: Vec::new(),
+            wait_tx_confirmed: false,
+            wait_for_all_submits: false,
+            durable_nonce: None,
+            simulate: false,
+            grpc_recv_us: None,
+        }
+    }
+
+    /// Create a simple buy request using a durable nonce instead of a recent blockhash.
+    ///
+    /// Use this when sending through multiple SWQoS lanes with the same nonce.
+    pub fn with_durable_nonce(
+        dex_type: DexType,
+        pay_with: TradeTokenType,
+        mint: Pubkey,
+        amount: BuyAmount,
+        extension_params: DexParamEnum,
+        durable_nonce: DurableNonceInfo,
+        gas_fee_strategy: GasFeeStrategy,
+    ) -> Self {
+        Self {
+            durable_nonce: Some(durable_nonce),
+            recent_blockhash: None,
+            ..Self::new(
+                dex_type,
+                pay_with,
+                mint,
+                amount,
+                extension_params,
+                Hash::default(),
+                gas_fee_strategy,
+            )
+        }
+    }
+
+    /// Set slippage in basis points. `100` means 1%.
+    pub fn slippage_basis_points(mut self, value: u64) -> Self {
+        self.slippage_basis_points = Some(value);
+        self
+    }
+
+    /// Set account lifecycle behavior. Bots usually want `HotPathMinimal`;
+    /// normal integrations can keep the default `Auto`.
+    pub fn account_policy(mut self, value: AccountPolicy) -> Self {
+        self.account_policy = value;
+        self
+    }
+
+    /// Attach Address Lookup Tables to reduce transaction size.
+    /// Pass one element for a single ALT or multiple elements for multi-ALT.
+    pub fn address_lookup_table_accounts(mut self, values: Vec<AddressLookupTableAccount>) -> Self {
+        self.address_lookup_table_accounts = values;
+        self
+    }
+
+    /// Use a durable nonce instead of the recent blockhash passed to [`Self::new`].
+    ///
+    /// This clears `recent_blockhash` because nonce transactions must use the
+    /// nonce value as their transaction blockhash.
+    pub fn durable_nonce(mut self, value: DurableNonceInfo) -> Self {
+        self.durable_nonce = Some(value);
+        self.recent_blockhash = None;
+        self
+    }
+
+    /// Wait for confirmation before returning.
+    pub fn wait_tx_confirmed(mut self, value: bool) -> Self {
+        self.wait_tx_confirmed = value;
+        self
+    }
+
+    /// Wait for all SWQoS submit responses and return submitted signatures.
+    pub fn wait_for_all_submits(mut self, value: bool) -> Self {
+        self.wait_for_all_submits = value;
+        self
+    }
+
+    /// Simulate instead of submitting.
+    pub fn simulate(mut self, value: bool) -> Self {
+        self.simulate = value;
+        self
+    }
+
+    /// Attach upstream receive timestamp for latency tracing.
+    pub fn grpc_recv_us(mut self, value: i64) -> Self {
+        self.grpc_recv_us = Some(value);
+        self
+    }
+}
+
+impl SimpleSellParams {
+    /// Create a simple sell request using a recent blockhash.
+    ///
+    /// Defaults:
+    /// - `account_policy = AccountPolicy::Auto`
+    /// - `with_tip = true`
+    /// - `wait_tx_confirmed = false`
+    /// - `wait_for_all_submits = false`
+    /// - `simulate = false`
+    /// - no ALT
+    /// - no slippage override
+    pub fn new(
+        dex_type: DexType,
+        receive_as: TradeTokenType,
+        mint: Pubkey,
+        amount: SellAmount,
+        extension_params: DexParamEnum,
+        recent_blockhash: Hash,
+        gas_fee_strategy: GasFeeStrategy,
+    ) -> Self {
+        Self {
+            dex_type,
+            receive_as,
+            mint,
+            amount,
+            slippage_basis_points: None,
+            recent_blockhash: Some(recent_blockhash),
+            extension_params,
+            gas_fee_strategy,
+            account_policy: AccountPolicy::Auto,
+            address_lookup_table_accounts: Vec::new(),
+            wait_tx_confirmed: false,
+            wait_for_all_submits: false,
+            durable_nonce: None,
+            simulate: false,
+            with_tip: true,
+            grpc_recv_us: None,
+        }
+    }
+
+    /// Create a simple sell request using a durable nonce instead of a recent blockhash.
+    pub fn with_durable_nonce(
+        dex_type: DexType,
+        receive_as: TradeTokenType,
+        mint: Pubkey,
+        amount: SellAmount,
+        extension_params: DexParamEnum,
+        durable_nonce: DurableNonceInfo,
+        gas_fee_strategy: GasFeeStrategy,
+    ) -> Self {
+        Self {
+            durable_nonce: Some(durable_nonce),
+            recent_blockhash: None,
+            ..Self::new(
+                dex_type,
+                receive_as,
+                mint,
+                amount,
+                extension_params,
+                Hash::default(),
+                gas_fee_strategy,
+            )
+        }
+    }
+
+    /// Set slippage in basis points. `100` means 1%.
+    pub fn slippage_basis_points(mut self, value: u64) -> Self {
+        self.slippage_basis_points = Some(value);
+        self
+    }
+
+    /// Set account lifecycle behavior. Bots usually want `HotPathMinimal`;
+    /// normal integrations can keep the default `Auto`.
+    pub fn account_policy(mut self, value: AccountPolicy) -> Self {
+        self.account_policy = value;
+        self
+    }
+
+    /// Attach Address Lookup Tables to reduce transaction size.
+    /// Pass one element for a single ALT or multiple elements for multi-ALT.
+    pub fn address_lookup_table_accounts(mut self, values: Vec<AddressLookupTableAccount>) -> Self {
+        self.address_lookup_table_accounts = values;
+        self
+    }
+
+    /// Use a durable nonce instead of the recent blockhash passed to [`Self::new`].
+    ///
+    /// This clears `recent_blockhash` because nonce transactions must use the
+    /// nonce value as their transaction blockhash.
+    pub fn durable_nonce(mut self, value: DurableNonceInfo) -> Self {
+        self.durable_nonce = Some(value);
+        self.recent_blockhash = None;
+        self
+    }
+
+    /// Wait for confirmation before returning.
+    pub fn wait_tx_confirmed(mut self, value: bool) -> Self {
+        self.wait_tx_confirmed = value;
+        self
+    }
+
+    /// Wait for all SWQoS submit responses and return submitted signatures.
+    pub fn wait_for_all_submits(mut self, value: bool) -> Self {
+        self.wait_for_all_submits = value;
+        self
+    }
+
+    /// Simulate instead of submitting.
+    pub fn simulate(mut self, value: bool) -> Self {
+        self.simulate = value;
+        self
+    }
+
+    /// Enable or disable relay tips for sell transactions.
+    pub fn with_tip(mut self, value: bool) -> Self {
+        self.with_tip = value;
+        self
+    }
+
+    /// Attach upstream receive timestamp for latency tracing.
+    pub fn grpc_recv_us(mut self, value: i64) -> Self {
+        self.grpc_recv_us = Some(value);
+        self
+    }
+}
+
 /// Shared infrastructure components that can be reused across multiple wallets
 ///
 /// This struct holds the expensive-to-initialize components (RPC client, SWQOS clients)
@@ -83,7 +515,7 @@ pub struct TradingInfrastructure {
     pub swqos_clients: Arc<Vec<Arc<SwqosClient>>>,
     /// Configuration used to create this infrastructure
     pub config: InfrastructureConfig,
-    /// Precomputed at init: min(swqos_clients.len(), 2/3 * num_cores). Not computed on trade hot path.
+    /// Precomputed at init: min(max SWQOS submit lanes, 2/3 * num_cores). Not computed on trade hot path.
     pub max_sender_concurrency: usize,
     /// Precomputed at init: first max_sender_concurrency CoreIds for job affinity. Empty if no cores. Not computed on trade hot path.
     pub effective_core_ids: Arc<Vec<core_affinity::CoreId>>,
@@ -133,8 +565,9 @@ impl TradingInfrastructure {
 
         // Create SWQOS clients with blacklist checking（QUIC 握手可能较慢，单节点超时 15s）
         const SWQOS_CLIENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+        let swqos_configs = normalize_swqos_configs(&config.rpc_url, &config.swqos_configs);
         let mut swqos_clients: Vec<Arc<SwqosClient>> = vec![];
-        for swqos in &config.swqos_configs {
+        for swqos in &swqos_configs {
             if swqos.is_blacklisted() {
                 if sdk_log::sdk_log_enabled() {
                     warn!(target: "sol_trade_sdk", "⚠️ SWQOS {:?} is blacklisted, skipping", swqos.swqos_type());
@@ -225,11 +658,21 @@ impl TradingInfrastructure {
             eprintln!("ℹ️  SWQOS 通道已就绪: {} 条 → [{}]", swqos_clients.len(), labels.join(", "));
         }
 
-        let swqos_count = swqos_clients.len();
+        let max_submit_lanes = swqos_clients
+            .iter()
+            .map(|client| {
+                if matches!(client.get_swqos_type(), SwqosType::Default) {
+                    1usize
+                } else {
+                    2usize
+                }
+            })
+            .sum::<usize>()
+            .max(1);
         let (max_sender_concurrency, effective_core_ids) = {
             let num_cores = core_affinity::get_core_ids().map(|c| c.len()).unwrap_or(0);
             let max_by_cores = (num_cores * 2 / 3).max(1);
-            let cap = swqos_count.min(max_by_cores).max(1);
+            let cap = max_submit_lanes.min(max_by_cores).max(1);
             let ids = core_affinity::get_core_ids()
                 .map(|all| {
                     let v: Vec<_> = all.into_iter().collect();
@@ -301,8 +744,6 @@ pub struct TradingClient {
     pub log_enabled: bool,
     /// Whether to check minimum tip per SWQOS (from TradeConfig.check_min_tip). Default false for lower latency.
     pub check_min_tip: bool,
-    /// Use PumpFun V2 instructions (buy_v2 / sell_v2, 27-account metas). Default false.
-    pub use_pumpfun_v2: bool,
 }
 
 static INSTANCE: Mutex<Option<Arc<TradingClient>>> = Mutex::new(None);
@@ -323,7 +764,6 @@ impl Clone for TradingClient {
             effective_core_ids: self.effective_core_ids.clone(),
             log_enabled: self.log_enabled,
             check_min_tip: self.check_min_tip,
-            use_pumpfun_v2: self.use_pumpfun_v2,
         }
     }
 }
@@ -350,10 +790,17 @@ pub struct TradeBuyParams {
     /// Protocol-specific parameters (PumpFun, Raydium, etc.)
     pub extension_params: DexParamEnum,
     // Extended configuration
-    /// Optional address lookup table for transaction size optimization
-    pub address_lookup_table_account: Option<AddressLookupTableAccount>,
+    /// Optional address lookup tables for transaction size optimization.
+    /// Pass one element for a single ALT or multiple elements for multi-ALT.
+    pub address_lookup_table_accounts: Vec<AddressLookupTableAccount>,
     /// Whether to wait for transaction confirmation before returning
     pub wait_tx_confirmed: bool,
+    /// When true, wait for every SWQOS route's HTTP submit response so all
+    /// submitted signatures are returned. This applies whether SDK confirmation
+    /// is enabled or the caller monitors externally. Recent-blockhash route
+    /// variants are not mutually exclusive; durable nonce variants are.
+    /// Defaults to false. See `SwapParams.wait_for_all_submits`.
+    pub wait_for_all_submits: bool,
     /// Whether to create input token associated token account
     pub create_input_token_ata: bool,
     /// Whether to close input token associated token account after trade
@@ -369,7 +816,7 @@ pub struct TradeBuyParams {
     pub gas_fee_strategy: GasFeeStrategy,
     /// Whether to simulate the transaction instead of executing it
     pub simulate: bool,
-    /// Use exact SOL amount instructions (buy_exact_sol_in for PumpFun, buy_exact_quote_in for PumpSwap).
+    /// Use exact quote-input buy instructions (legacy PumpFun uses SOL quote; V2/PumpSwap use generic quote).
     /// When Some(true) or None (default), the exact SOL/quote amount is spent and slippage is applied to output tokens.
     /// When Some(false), uses regular buy instruction where slippage is applied to SOL/quote input.
     /// This option only applies to PumpFun and PumpSwap DEXes; it is ignored for other DEXes.
@@ -402,10 +849,17 @@ pub struct TradeSellParams {
     /// Protocol-specific parameters (PumpFun, Raydium, etc.)
     pub extension_params: DexParamEnum,
     // Extended configuration
-    /// Optional address lookup table for transaction size optimization
-    pub address_lookup_table_account: Option<AddressLookupTableAccount>,
+    /// Optional address lookup tables for transaction size optimization.
+    /// Pass one element for a single ALT or multiple elements for multi-ALT.
+    pub address_lookup_table_accounts: Vec<AddressLookupTableAccount>,
     /// Whether to wait for transaction confirmation before returning
     pub wait_tx_confirmed: bool,
+    /// When true, wait for every SWQOS route's HTTP submit response so all
+    /// submitted signatures are returned. This applies whether SDK confirmation
+    /// is enabled or the caller monitors externally. Recent-blockhash route
+    /// variants are not mutually exclusive; durable nonce variants are.
+    /// Defaults to false. See `SwapParams.wait_for_all_submits`.
+    pub wait_for_all_submits: bool,
     /// Whether to create output token associated token account
     pub create_output_token_ata: bool,
     /// Whether to close output token associated token account after trade
@@ -423,6 +877,96 @@ pub struct TradeSellParams {
     pub simulate: bool,
     /// Optional upstream receive timestamp (e.g. gRPC recv) in microseconds for latency tracing.
     pub grpc_recv_us: Option<i64>,
+}
+
+#[inline]
+fn buy_account_flags(policy: AccountPolicy) -> (bool, bool, bool) {
+    match policy {
+        AccountPolicy::Auto => (false, true, false),
+        AccountPolicy::HotPathMinimal | AccountPolicy::AssumePrepared => (false, false, false),
+        AccountPolicy::CreateMissing => (true, true, false),
+    }
+}
+
+#[inline]
+fn sell_account_flags(policy: AccountPolicy, receive_as: &TradeTokenType) -> (bool, bool, bool) {
+    match policy {
+        AccountPolicy::Auto => (*receive_as != TradeTokenType::SOL, false, false),
+        AccountPolicy::HotPathMinimal | AccountPolicy::AssumePrepared => (false, false, false),
+        AccountPolicy::CreateMissing => (true, false, false),
+    }
+}
+
+impl From<SimpleBuyParams> for TradeBuyParams {
+    fn from(params: SimpleBuyParams) -> Self {
+        let (input_token_amount, fixed_output_token_amount, use_exact_sol_amount) =
+            match params.amount {
+                BuyAmount::ExactInput(amount) => (amount, None, Some(true)),
+                BuyAmount::ExactOutput { output_amount, max_input_amount } => {
+                    (max_input_amount, Some(output_amount), Some(true))
+                }
+                BuyAmount::WithMaxInput { quote_amount } => (quote_amount, None, Some(false)),
+            };
+        let (create_input_token_ata, create_mint_ata, close_input_token_ata) =
+            buy_account_flags(params.account_policy);
+
+        TradeBuyParams {
+            dex_type: params.dex_type,
+            input_token_type: params.pay_with,
+            mint: params.mint,
+            input_token_amount,
+            slippage_basis_points: params.slippage_basis_points,
+            recent_blockhash: params.recent_blockhash,
+            extension_params: params.extension_params,
+            address_lookup_table_accounts: params.address_lookup_table_accounts,
+            wait_tx_confirmed: params.wait_tx_confirmed,
+            wait_for_all_submits: params.wait_for_all_submits,
+            create_input_token_ata,
+            close_input_token_ata,
+            create_mint_ata,
+            durable_nonce: params.durable_nonce,
+            fixed_output_token_amount,
+            gas_fee_strategy: params.gas_fee_strategy,
+            simulate: params.simulate,
+            use_exact_sol_amount,
+            grpc_recv_us: params.grpc_recv_us,
+        }
+    }
+}
+
+impl From<SimpleSellParams> for TradeSellParams {
+    fn from(params: SimpleSellParams) -> Self {
+        let (input_token_amount, fixed_output_token_amount) = match params.amount {
+            SellAmount::ExactInput(amount) => (amount, None),
+            SellAmount::ExactOutput { output_amount, max_input_amount } => {
+                (max_input_amount, Some(output_amount))
+            }
+        };
+        let (create_output_token_ata, close_output_token_ata, close_mint_token_ata) =
+            sell_account_flags(params.account_policy, &params.receive_as);
+
+        TradeSellParams {
+            dex_type: params.dex_type,
+            output_token_type: params.receive_as,
+            mint: params.mint,
+            input_token_amount,
+            slippage_basis_points: params.slippage_basis_points,
+            recent_blockhash: params.recent_blockhash,
+            with_tip: params.with_tip,
+            extension_params: params.extension_params,
+            address_lookup_table_accounts: params.address_lookup_table_accounts,
+            wait_tx_confirmed: params.wait_tx_confirmed,
+            wait_for_all_submits: params.wait_for_all_submits,
+            create_output_token_ata,
+            close_output_token_ata,
+            close_mint_token_ata,
+            durable_nonce: params.durable_nonce,
+            fixed_output_token_amount,
+            gas_fee_strategy: params.gas_fee_strategy,
+            simulate: params.simulate,
+            grpc_recv_us: params.grpc_recv_us,
+        }
+    }
 }
 
 impl TradingClient {
@@ -460,7 +1004,6 @@ impl TradingClient {
             effective_core_ids,
             log_enabled: true,
             check_min_tip: false,
-            use_pumpfun_v2: false,
         }
     }
 
@@ -507,7 +1050,6 @@ impl TradingClient {
             effective_core_ids,
             log_enabled: true,
             check_min_tip: false,
-            use_pumpfun_v2: false,
         }
     }
 
@@ -687,7 +1229,6 @@ impl TradingClient {
             effective_core_ids: infrastructure.effective_core_ids.clone(),
             log_enabled: trade_config.log_enabled,
             check_min_tip: trade_config.check_min_tip,
-            use_pumpfun_v2: trade_config.use_pumpfun_v2,
         };
 
         let mut current = INSTANCE.lock();
@@ -713,7 +1254,7 @@ impl TradingClient {
 
     /// **Advanced.** Use dedicated OS threads for sender pool (and optionally pin to cores).  
     /// By default the SDK uses a shared tokio pool; this can reduce scheduling contention when sending many txs.  
-    /// Concurrency and core count are capped internally (≤ swqos count, ≤ 2/3 of CPU cores).  
+    /// Concurrency and core count are capped internally (≤ max submit lanes, ≤ 2/3 of CPU cores).
     /// - `None`: keep default (shared tokio pool).  
     /// - `Some(vec![])`: dedicated threads with default count, no core pinning.  
     /// - `Some(indices)`: dedicated threads pinned to those core indices (trimmed to cap).  
@@ -736,6 +1277,12 @@ impl TradingClient {
                 self.sender_thread_cores =
                     Some(Arc::new(if cap < v.len() { v[..cap].to_vec() } else { v }));
             }
+        }
+        if self.use_dedicated_sender_threads {
+            crate::trading::core::async_executor::warm_dedicated_sender_pool(
+                self.sender_thread_cores.as_ref().map(|v| v.as_slice()),
+                self.max_sender_concurrency,
+            );
         }
         self
     }
@@ -801,6 +1348,12 @@ impl TradingClient {
         (bool, Vec<Signature>, Option<TradeError>, Vec<(crate::swqos::SwqosType, i64)>),
         anyhow::Error,
     > {
+        validate_trade_safety(
+            "buy",
+            params.input_token_amount,
+            params.fixed_output_token_amount,
+            params.slippage_basis_points,
+        )?;
         if params.recent_blockhash.is_none() && params.durable_nonce.is_none() {
             return Err(anyhow::anyhow!(
                 "Must provide either recent_blockhash or durable_nonce for buy (required for transaction validity)"
@@ -846,7 +1399,7 @@ impl TradingClient {
             output_token_program: None,
             input_amount: Some(params.input_token_amount),
             slippage_basis_points: params.slippage_basis_points,
-            address_lookup_table_account: params.address_lookup_table_account,
+            address_lookup_table_accounts: params.address_lookup_table_accounts,
             recent_blockhash: params.recent_blockhash,
             wait_tx_confirmed: params.wait_tx_confirmed,
             protocol_params,
@@ -863,6 +1416,7 @@ impl TradingClient {
             gas_fee_strategy: params.gas_fee_strategy,
             simulate: params.simulate,
             log_enabled: self.log_enabled,
+            wait_for_all_submits: params.wait_for_all_submits,
             use_dedicated_sender_threads: self.use_dedicated_sender_threads,
             sender_thread_cores: self.sender_thread_cores.clone(),
             max_sender_concurrency: self.max_sender_concurrency,
@@ -870,14 +1424,29 @@ impl TradingClient {
             check_min_tip: self.check_min_tip,
             grpc_recv_us: params.grpc_recv_us,
             use_exact_sol_amount: params.use_exact_sol_amount,
-            use_pumpfun_v2: self.use_pumpfun_v2,
         };
 
         let swap_result = executor.swap(buy_params).await;
         let result = swap_result.map(|(success, sigs, err, timings)| {
-            (success, sigs, err.map(TradeError::from), timings)
+            let legacy_timings = timings
+                .into_iter()
+                .map(|timing| (timing.swqos_type, timing.submit_done_us))
+                .collect();
+            (success, sigs, err.map(TradeError::from), legacy_timings)
         });
         result
+    }
+
+    /// Execute a high-level buy request.
+    #[inline]
+    pub async fn buy_simple(
+        &self,
+        params: SimpleBuyParams,
+    ) -> Result<
+        (bool, Vec<Signature>, Option<TradeError>, Vec<(crate::swqos::SwqosType, i64)>),
+        anyhow::Error,
+    > {
+        self.buy(params.into()).await
     }
 
     /// Execute a sell order for a specified token
@@ -913,6 +1482,12 @@ impl TradingClient {
         (bool, Vec<Signature>, Option<TradeError>, Vec<(crate::swqos::SwqosType, i64)>),
         anyhow::Error,
     > {
+        validate_trade_safety(
+            "sell",
+            params.input_token_amount,
+            params.fixed_output_token_amount,
+            params.slippage_basis_points,
+        )?;
         #[cfg(feature = "perf-trace")]
         if sdk_log::sdk_log_enabled() && params.slippage_basis_points.is_none() {
             debug!(
@@ -958,7 +1533,7 @@ impl TradingClient {
             output_token_program: None,
             input_amount: Some(params.input_token_amount),
             slippage_basis_points: params.slippage_basis_points,
-            address_lookup_table_account: params.address_lookup_table_account,
+            address_lookup_table_accounts: params.address_lookup_table_accounts,
             recent_blockhash: params.recent_blockhash,
             wait_tx_confirmed: params.wait_tx_confirmed,
             protocol_params,
@@ -975,6 +1550,7 @@ impl TradingClient {
             gas_fee_strategy: params.gas_fee_strategy,
             simulate: params.simulate,
             log_enabled: self.log_enabled,
+            wait_for_all_submits: params.wait_for_all_submits,
             use_dedicated_sender_threads: self.use_dedicated_sender_threads,
             sender_thread_cores: self.sender_thread_cores.clone(),
             max_sender_concurrency: self.max_sender_concurrency,
@@ -982,14 +1558,29 @@ impl TradingClient {
             check_min_tip: self.check_min_tip,
             grpc_recv_us: params.grpc_recv_us,
             use_exact_sol_amount: None,
-            use_pumpfun_v2: self.use_pumpfun_v2,
         };
 
         let swap_result = executor.swap(sell_params).await;
         let result = swap_result.map(|(success, sigs, err, timings)| {
-            (success, sigs, err.map(TradeError::from), timings)
+            let legacy_timings = timings
+                .into_iter()
+                .map(|timing| (timing.swqos_type, timing.submit_done_us))
+                .collect();
+            (success, sigs, err.map(TradeError::from), legacy_timings)
         });
         result
+    }
+
+    /// Execute a high-level sell request.
+    #[inline]
+    pub async fn sell_simple(
+        &self,
+        params: SimpleSellParams,
+    ) -> Result<
+        (bool, Vec<Signature>, Option<TradeError>, Vec<(crate::swqos::SwqosType, i64)>),
+        anyhow::Error,
+    > {
+        self.sell(params.into()).await
     }
 
     /// Execute a sell order for a percentage of the specified token amount
@@ -1238,5 +1829,280 @@ impl TradingClient {
         transaction.sign(&[&*self.payer], recent_blockhash);
         let signature = self.infrastructure.rpc.send_and_confirm_transaction(&transaction).await?;
         Ok(signature.to_string())
+    }
+}
+
+fn validate_trade_safety(
+    side: &str,
+    input_amount: u64,
+    fixed_output_amount: Option<u64>,
+    slippage_basis_points: Option<u64>,
+) -> Result<(), anyhow::Error> {
+    if input_amount == 0 {
+        return Err(anyhow::anyhow!("{} input amount must be greater than zero", side));
+    }
+    if fixed_output_amount == Some(0) {
+        return Err(anyhow::anyhow!("{} fixed output amount must be greater than zero", side));
+    }
+    if let Some(bps) = slippage_basis_points {
+        if bps >= 10_000 {
+            return Err(anyhow::anyhow!(
+                "{} slippage_basis_points must be below 10000, got {}",
+                side,
+                bps
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::instruction::utils::pumpfun::global_constants;
+    use crate::swqos::SwqosRegion;
+    use std::sync::Arc;
+
+    fn dummy_pumpfun_params() -> DexParamEnum {
+        DexParamEnum::PumpFun(PumpFunParams {
+            bonding_curve: Arc::new(Default::default()),
+            associated_bonding_curve: Pubkey::default(),
+            observed_trade_creator: None,
+            creator_vault: Pubkey::default(),
+            fee_sharing_creator_vault_if_active: None,
+            token_program: Pubkey::default(),
+            close_token_account_when_sell: None,
+            fee_recipient: global_constants::FEE_RECIPIENT,
+            quote_mint: Pubkey::default(),
+        })
+    }
+
+    #[test]
+    fn trade_safety_rejects_zero_amounts_and_unbounded_slippage() {
+        assert!(validate_trade_safety("buy", 0, None, Some(100)).is_err());
+        assert!(validate_trade_safety("buy", 1, Some(0), Some(100)).is_err());
+        assert!(validate_trade_safety("sell", 1, None, Some(10_000)).is_err());
+        assert!(validate_trade_safety("sell", 1, None, Some(u64::MAX)).is_err());
+    }
+
+    #[test]
+    fn trade_safety_accepts_bounded_values() {
+        assert!(validate_trade_safety("buy", 1, None, None).is_ok());
+        assert!(validate_trade_safety("buy", 1, Some(1), Some(9_999)).is_ok());
+    }
+
+    #[test]
+    fn normalize_swqos_configs_adds_default_rpc_route() {
+        let configs = vec![SwqosConfig::Jito("uuid".to_string(), SwqosRegion::Frankfurt, None)];
+        let normalized = normalize_swqos_configs("https://rpc.example", &configs);
+
+        assert_eq!(normalized.len(), 2);
+        assert!(normalized.iter().any(|c| matches!(c.swqos_type(), SwqosType::Jito)));
+        assert!(normalized.iter().any(|c| matches!(c.swqos_type(), SwqosType::Default)));
+    }
+
+    #[test]
+    fn normalize_swqos_configs_does_not_duplicate_default_rpc_route() {
+        let configs = vec![SwqosConfig::Default("https://rpc.example".to_string())];
+        let normalized = normalize_swqos_configs("https://rpc.example", &configs);
+
+        assert_eq!(normalized.len(), 1);
+        assert!(matches!(normalized[0].swqos_type(), SwqosType::Default));
+    }
+
+    #[test]
+    fn simple_buy_hot_path_maps_to_low_level_params() {
+        let simple = SimpleBuyParams {
+            dex_type: DexType::PumpFun,
+            pay_with: TradeTokenType::SOL,
+            mint: Pubkey::new_unique(),
+            amount: BuyAmount::WithMaxInput { quote_amount: 10_000 },
+            slippage_basis_points: Some(100),
+            recent_blockhash: Some(Hash::new_unique()),
+            extension_params: dummy_pumpfun_params(),
+            gas_fee_strategy: GasFeeStrategy::new(),
+            account_policy: AccountPolicy::HotPathMinimal,
+            address_lookup_table_accounts: Vec::new(),
+            wait_tx_confirmed: false,
+            wait_for_all_submits: false,
+            durable_nonce: None,
+            simulate: false,
+            grpc_recv_us: None,
+        };
+
+        let low: TradeBuyParams = simple.into();
+
+        assert!(matches!(low.input_token_type, TradeTokenType::SOL));
+        assert_eq!(low.input_token_amount, 10_000);
+        assert_eq!(low.use_exact_sol_amount, Some(false));
+        assert_eq!(low.fixed_output_token_amount, None);
+        assert!(!low.create_input_token_ata);
+        assert!(!low.close_input_token_ata);
+        assert!(!low.create_mint_ata);
+    }
+
+    #[test]
+    fn simple_buy_auto_creates_target_mint_ata() {
+        let simple = SimpleBuyParams {
+            dex_type: DexType::PumpFun,
+            pay_with: TradeTokenType::SOL,
+            mint: Pubkey::new_unique(),
+            amount: BuyAmount::ExactOutput { output_amount: 42, max_input_amount: 10_000 },
+            slippage_basis_points: None,
+            recent_blockhash: Some(Hash::new_unique()),
+            extension_params: dummy_pumpfun_params(),
+            gas_fee_strategy: GasFeeStrategy::new(),
+            account_policy: AccountPolicy::Auto,
+            address_lookup_table_accounts: Vec::new(),
+            wait_tx_confirmed: false,
+            wait_for_all_submits: false,
+            durable_nonce: None,
+            simulate: false,
+            grpc_recv_us: None,
+        };
+
+        let low: TradeBuyParams = simple.into();
+
+        assert_eq!(low.input_token_amount, 10_000);
+        assert_eq!(low.fixed_output_token_amount, Some(42));
+        assert_eq!(low.use_exact_sol_amount, Some(true));
+        assert!(low.create_mint_ata);
+        assert!(!low.create_input_token_ata);
+    }
+
+    #[test]
+    fn simple_buy_builder_sets_defaults_and_overrides() {
+        let simple = SimpleBuyParams::new(
+            DexType::PumpFun,
+            TradeTokenType::SOL,
+            Pubkey::new_unique(),
+            BuyAmount::ExactInput(10_000),
+            dummy_pumpfun_params(),
+            Hash::new_unique(),
+            GasFeeStrategy::new(),
+        )
+        .slippage_basis_points(250)
+        .account_policy(AccountPolicy::HotPathMinimal);
+
+        let low: TradeBuyParams = simple.into();
+
+        assert_eq!(low.slippage_basis_points, Some(250));
+        assert_eq!(low.use_exact_sol_amount, Some(true));
+        assert!(!low.create_input_token_ata);
+        assert!(!low.create_mint_ata);
+        assert!(!low.wait_tx_confirmed);
+    }
+
+    #[test]
+    fn simple_buy_builder_maps_multiple_lookup_tables() {
+        let alt1 = AddressLookupTableAccount {
+            key: Pubkey::new_unique(),
+            addresses: vec![Pubkey::new_unique()],
+        };
+        let alt2 = AddressLookupTableAccount {
+            key: Pubkey::new_unique(),
+            addresses: vec![Pubkey::new_unique()],
+        };
+
+        let simple = SimpleBuyParams::new(
+            DexType::PumpFun,
+            TradeTokenType::SOL,
+            Pubkey::new_unique(),
+            BuyAmount::ExactInput(10_000),
+            dummy_pumpfun_params(),
+            Hash::new_unique(),
+            GasFeeStrategy::new(),
+        )
+        .address_lookup_table_accounts(vec![alt1.clone(), alt2.clone()]);
+
+        let low: TradeBuyParams = simple.into();
+
+        assert_eq!(low.address_lookup_table_accounts.len(), 2);
+        assert_eq!(low.address_lookup_table_accounts[0].key, alt1.key);
+        assert_eq!(low.address_lookup_table_accounts[1].key, alt2.key);
+    }
+
+    #[test]
+    fn simple_buy_builder_can_use_durable_nonce() {
+        let nonce_account = Pubkey::new_unique();
+        let nonce_hash = Hash::new_unique();
+        let durable_nonce = DurableNonceInfo {
+            nonce_account: Some(nonce_account),
+            current_nonce: Some(nonce_hash),
+        };
+
+        let simple = SimpleBuyParams::new(
+            DexType::PumpFun,
+            TradeTokenType::SOL,
+            Pubkey::new_unique(),
+            BuyAmount::ExactInput(10_000),
+            dummy_pumpfun_params(),
+            Hash::new_unique(),
+            GasFeeStrategy::new(),
+        )
+        .durable_nonce(durable_nonce.clone());
+
+        let low: TradeBuyParams = simple.into();
+
+        assert!(low.recent_blockhash.is_none());
+        assert_eq!(low.durable_nonce.as_ref().and_then(|n| n.nonce_account), Some(nonce_account));
+        assert_eq!(low.durable_nonce.as_ref().and_then(|n| n.current_nonce), Some(nonce_hash));
+    }
+
+    #[test]
+    fn simple_sell_auto_creates_non_sol_output_ata() {
+        let simple = SimpleSellParams {
+            dex_type: DexType::PumpFun,
+            receive_as: TradeTokenType::USDC,
+            mint: Pubkey::new_unique(),
+            amount: SellAmount::ExactInput(50_000),
+            slippage_basis_points: None,
+            recent_blockhash: Some(Hash::new_unique()),
+            extension_params: dummy_pumpfun_params(),
+            gas_fee_strategy: GasFeeStrategy::new(),
+            account_policy: AccountPolicy::Auto,
+            address_lookup_table_accounts: Vec::new(),
+            wait_tx_confirmed: false,
+            wait_for_all_submits: false,
+            durable_nonce: None,
+            simulate: false,
+            with_tip: true,
+            grpc_recv_us: None,
+        };
+
+        let low: TradeSellParams = simple.into();
+
+        assert!(matches!(low.output_token_type, TradeTokenType::USDC));
+        assert_eq!(low.input_token_amount, 50_000);
+        assert!(low.create_output_token_ata);
+        assert!(!low.close_output_token_ata);
+        assert!(!low.close_mint_token_ata);
+    }
+
+    #[test]
+    fn simple_sell_builder_can_use_durable_nonce() {
+        let nonce_account = Pubkey::new_unique();
+        let nonce_hash = Hash::new_unique();
+        let durable_nonce = DurableNonceInfo {
+            nonce_account: Some(nonce_account),
+            current_nonce: Some(nonce_hash),
+        };
+
+        let simple = SimpleSellParams::new(
+            DexType::PumpFun,
+            TradeTokenType::SOL,
+            Pubkey::new_unique(),
+            SellAmount::ExactInput(50_000),
+            dummy_pumpfun_params(),
+            Hash::new_unique(),
+            GasFeeStrategy::new(),
+        )
+        .durable_nonce(durable_nonce.clone());
+
+        let low: TradeSellParams = simple.into();
+
+        assert!(low.recent_blockhash.is_none());
+        assert_eq!(low.durable_nonce.as_ref().and_then(|n| n.nonce_account), Some(nonce_account));
+        assert_eq!(low.durable_nonce.as_ref().and_then(|n| n.current_nonce), Some(nonce_hash));
     }
 }

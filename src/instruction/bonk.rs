@@ -365,7 +365,7 @@ mod tests {
             output_token_program: None,
             input_amount: Some(100_000),
             slippage_basis_points: Some(100),
-            address_lookup_table_account: None,
+            address_lookup_table_accounts: Vec::new(),
             recent_blockhash: None,
             wait_tx_confirmed: false,
             protocol_params: DexParamEnum::Bonk(bonk_params()),
@@ -382,6 +382,7 @@ mod tests {
             gas_fee_strategy: GasFeeStrategy::new(),
             simulate: true,
             log_enabled: false,
+            wait_for_all_submits: false,
             use_dedicated_sender_threads: false,
             sender_thread_cores: None,
             max_sender_concurrency: 0,
@@ -389,7 +390,6 @@ mod tests {
             check_min_tip: false,
             grpc_recv_us: None,
             use_exact_sol_amount: None,
-            use_pumpfun_v2: false,
         }
     }
 

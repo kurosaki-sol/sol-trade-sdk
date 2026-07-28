@@ -23,7 +23,7 @@ use sol_trade_sdk::{
     SolanaTrade,
 };
 use solana_commitment_config::CommitmentConfig;
-use solana_sdk::{pubkey::Pubkey, signature::Keypair};
+use solana_sdk::pubkey::Pubkey;
 
 static ALREADY_EXECUTED: AtomicBool = AtomicBool::new(false);
 
@@ -104,7 +104,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn create_solana_trade_client() -> AnyResult<SolanaTrade> {
     println!("🚀 Initializing SolanaTrade client...");
-    let payer = Keypair::from_base58_string("use_your_payer_keypair_here");
+    let payer = sol_trade_sdk::common::keypair::load_keypair_from_env("PRIVATE_KEY")?;
     let rpc_url = "https://api.mainnet-beta.solana.com".to_string();
     let commitment = CommitmentConfig::confirmed();
     let swqos_configs: Vec<SwqosConfig> = vec![SwqosConfig::Default(rpc_url.clone())];
@@ -129,6 +129,16 @@ async fn pumpfun_copy_trade_with_grpc(
 
     let client = create_solana_trade_client().await?;
     let mint_pubkey = trade_info.mint;
+    let virtual_quote_reserves = if trade_info.virtual_quote_reserves != 0 {
+        trade_info.virtual_quote_reserves
+    } else {
+        trade_info.virtual_sol_reserves
+    };
+    let real_quote_reserves = if trade_info.virtual_quote_reserves != 0 {
+        trade_info.real_quote_reserves
+    } else {
+        trade_info.real_sol_reserves
+    };
     let slippage_basis_points = Some(100);
     let recent_blockhash = client.infrastructure.rpc.get_latest_blockhash().await?;
 
@@ -150,20 +160,22 @@ async fn pumpfun_copy_trade_with_grpc(
             trade_info.bonding_curve,
             trade_info.associated_bonding_curve,
             trade_info.mint,
+            trade_info.quote_mint,
             trade_info.creator,
             trade_info.creator_vault,
             trade_info.virtual_token_reserves,
-            trade_info.virtual_sol_reserves,
+            virtual_quote_reserves,
             trade_info.real_token_reserves,
-            trade_info.real_sol_reserves,
+            real_quote_reserves,
             None,
             trade_info.fee_recipient,
             trade_info.token_program,
             trade_info.is_cashback_coin,
             Some(trade_info.mayhem_mode),
         )),
-        address_lookup_table_account: None,
+        address_lookup_table_accounts: Vec::new(),
         wait_tx_confirmed: true,
+        wait_for_all_submits: false,
         create_input_token_ata: false,
         close_input_token_ata: false,
         create_mint_ata: true,

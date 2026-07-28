@@ -12,10 +12,9 @@ use std::{
 use tracing::{info, trace, warn};
 
 use super::{params::SwapParams, traits::InstructionBuilder};
-use crate::swqos::SwqosType;
 use crate::swqos::TradeType;
 use crate::{
-    common::{nonce_cache::DurableNonceInfo, GasFeeStrategy, SolanaRpcClient},
+    common::{nonce_cache::DurableNonceInfo, GasFeeStrategy, SolanaRpcClient, SwqosSubmitTiming},
     perf::syscall_bypass::SystemCallBypassManager,
     swqos::common::poll_any_transaction_confirmation,
     trading::core::{
@@ -56,7 +55,7 @@ impl TradeExecutor for GenericTradeExecutor {
     async fn swap(
         &self,
         params: SwapParams,
-    ) -> Result<(bool, Vec<Signature>, Option<anyhow::Error>, Vec<(SwqosType, i64)>)> {
+    ) -> Result<(bool, Vec<Signature>, Option<anyhow::Error>, Vec<SwqosSubmitTiming>)> {
         // Sample total start only when logging or simulate. 仅在有日志或 simulate 时取起点。
         let total_start = (params.log_enabled || params.simulate).then(Instant::now);
         let timing_start_us: Option<i64> = if params.log_enabled {
@@ -97,6 +96,7 @@ impl TradeExecutor for GenericTradeExecutor {
             total_start.as_ref().map(|s| s.elapsed()).unwrap_or(Duration::ZERO);
         let before_submit_us = (params.log_enabled && crate::common::sdk_log::sdk_log_enabled())
             .then(crate::common::clock::now_micros);
+        let address_lookup_table_accounts = params.address_lookup_table_accounts.clone();
 
         if params.simulate {
             let send_start = crate::common::sdk_log::sdk_log_enabled().then(Instant::now);
@@ -104,7 +104,7 @@ impl TradeExecutor for GenericTradeExecutor {
                 params.rpc,
                 params.payer,
                 final_instructions,
-                params.address_lookup_table_account,
+                address_lookup_table_accounts,
                 params.recent_blockhash,
                 params.durable_nonce,
                 params.middleware_manager,
@@ -158,18 +158,23 @@ impl TradeExecutor for GenericTradeExecutor {
         }
 
         let need_confirm = params.wait_tx_confirmed;
+        // Each SWQOS lane may submit a distinct transaction because relay tips
+        // can use different accounts, so confirmation must be able to poll every
+        // returned signature when the caller opts in.
+        let wait_for_all_submits = params.wait_for_all_submits;
         let sender_config = params.sender_concurrency_config();
         let result = execute_parallel(
             params.swqos_clients.as_slice(),
             params.payer,
             final_instructions,
-            params.address_lookup_table_account,
+            address_lookup_table_accounts,
             params.recent_blockhash,
             params.durable_nonce,
             params.middleware_manager,
             self.protocol_name,
             is_buy,
             false, // submit only here; confirmation and log timing handled below
+            wait_for_all_submits,
             if is_buy { true } else { params.with_tip },
             params.gas_fee_strategy,
             params.use_dedicated_sender_threads,
@@ -187,7 +192,7 @@ impl TradeExecutor for GenericTradeExecutor {
             Err(e) => (false, vec![], Some(anyhow::anyhow!("{}", e)), vec![]),
         };
         // submit_timings 为完成先后顺序（先完成的先 push），打印不排序、不增加延迟
-        let submit_timings_ref: &[(crate::swqos::SwqosType, i64)] = submit_timings.as_slice();
+        let submit_timings_ref: &[SwqosSubmitTiming] = submit_timings.as_slice();
 
         let result = if need_confirm {
             let confirm_result = if let Some(rpc) = params.rpc.as_ref() {
@@ -249,7 +254,7 @@ async fn simulate_transaction(
     rpc: Option<Arc<SolanaRpcClient>>,
     payer: Arc<Keypair>,
     instructions: Vec<Instruction>,
-    address_lookup_table_account: Option<AddressLookupTableAccount>,
+    address_lookup_table_accounts: Vec<AddressLookupTableAccount>,
     recent_blockhash: Option<Hash>,
     durable_nonce: Option<DurableNonceInfo>,
     middleware_manager: Option<Arc<MiddlewareManager>>,
@@ -257,7 +262,7 @@ async fn simulate_transaction(
     is_buy: bool,
     with_tip: bool,
     gas_fee_strategy: GasFeeStrategy,
-) -> Result<(bool, Vec<Signature>, Option<anyhow::Error>, Vec<(SwqosType, i64)>)> {
+) -> Result<(bool, Vec<Signature>, Option<anyhow::Error>, Vec<SwqosSubmitTiming>)> {
     use crate::trading::common::build_transaction;
     use solana_client::rpc_config::RpcSimulateTransactionConfig;
     use solana_commitment_config::CommitmentLevel;
@@ -284,7 +289,7 @@ async fn simulate_transaction(
         unit_limit,
         unit_price,
         &instructions,
-        address_lookup_table_account.as_ref(),
+        address_lookup_table_accounts.as_slice(),
         recent_blockhash,
         middleware_manager.as_ref(),
         protocol_name,
@@ -351,6 +356,7 @@ async fn simulate_transaction(
 
 #[cfg(test)]
 mod tests {
+    use crate::common::GasFeeStrategyType;
     use crate::swqos::SwqosType;
 
     /// 运行 `cargo test -p sol-trade-sdk log_timing_preview -- --nocapture` 查看日志打印效果
@@ -377,15 +383,17 @@ mod tests {
         );
 
         println!("\n--- 2. 每个 SWQOS 独立耗时：submit_done=起点→该通道提交完成, confirmed=该通道提交→链上确认, total=起点→链上确认 ---\n");
-        for (swqos_type, submit_ms, confirmed_ms, total_ms) in [
-            (SwqosType::Jito, 45.12, 83.38, 128.50),
-            (SwqosType::Helius, 52.30, 76.20, 128.50),
-            (SwqosType::ZeroSlot, 48.90, 79.60, 128.50),
+        for (swqos_type, strategy_type, submit_ms, confirmed_ms, total_ms) in [
+            (SwqosType::Jito, GasFeeStrategyType::LowTipHighCuPrice, 45.12, 83.38, 128.50),
+            (SwqosType::Jito, GasFeeStrategyType::HighTipLowCuPrice, 46.08, 82.42, 128.50),
+            (SwqosType::Helius, GasFeeStrategyType::LowTipHighCuPrice, 52.30, 76.20, 128.50),
+            (SwqosType::ZeroSlot, GasFeeStrategyType::Normal, 48.90, 79.60, 128.50),
         ] {
             println!(
-                " [SDK][{:width$}] {} submit_done: {:.4} ms, confirmed: {:.4} ms, total: {:.4} ms",
+                " [SDK][{:width$}] {} {} submit_done: {:.4} ms, confirmed: {:.4} ms, total: {:.4} ms",
                 swqos_type.as_str(),
                 dir,
+                strategy_type.as_str(),
                 submit_ms,
                 confirmed_ms,
                 total_ms,
@@ -396,13 +404,16 @@ mod tests {
         println!(
             "\n--- 3. 不等待链上确认时：每行 total = 该通道 submit_done（提交完成总耗时）---\n"
         );
-        for (swqos_type, submit_ms, total_ms) in
-            [(SwqosType::Jito, 44.20, 44.20), (SwqosType::Helius, 51.80, 51.80)]
-        {
+        for (swqos_type, strategy_type, submit_ms, total_ms) in [
+            (SwqosType::Jito, GasFeeStrategyType::LowTipHighCuPrice, 44.20, 44.20),
+            (SwqosType::Jito, GasFeeStrategyType::HighTipLowCuPrice, 45.10, 45.10),
+            (SwqosType::Helius, GasFeeStrategyType::Normal, 51.80, 51.80),
+        ] {
             println!(
-                " [SDK][{:width$}] {} submit_done: {:.4} ms, confirmed: -, total: {:.4} ms",
+                " [SDK][{:width$}] {} {} submit_done: {:.4} ms, confirmed: -, total: {:.4} ms",
                 swqos_type.as_str(),
                 dir,
+                strategy_type.as_str(),
                 submit_ms,
                 total_ms,
                 width = w
